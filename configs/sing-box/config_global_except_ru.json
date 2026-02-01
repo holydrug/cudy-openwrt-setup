@@ -1,0 +1,96 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-remote",
+        "address": "https://1.1.1.1/dns-query",
+        "address_resolver": "dns-direct",
+        "detour": "vless-out"
+      },
+      {
+        "tag": "dns-direct",
+        "address": "local",
+        "detour": "direct"
+      }
+    ],
+    "rules": [
+      {
+        "outbound": "direct",
+        "server": "dns-direct"
+      },
+      {
+        "rule_set": "geosite-category-ru",
+        "server": "dns-direct"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "type": "tproxy",
+      "tag": "tproxy-in",
+      "listen": "::",
+      "listen_port": 12346,
+      "sniff": true,
+      "sniff_override_destination": false
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-out",
+      "server": "%%VLESS_SERVER%%",
+      "server_port": %%VLESS_PORT%%,
+      "uuid": "%%VLESS_UUID%%",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "%%REALITY_SNI%%",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "%%REALITY_PUBLIC_KEY%%",
+          "short_id": "%%REALITY_SHORT_ID%%"
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "ip_cidr": ["%%VLESS_SERVER%%/32"],
+        "outbound": "direct"
+      },
+      {
+        "rule_set": ["geoip-ru", "geosite-category-ru"],
+        "outbound": "direct"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geoip-ru",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
+        "download_detour": "vless-out"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-category-ru",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs",
+        "download_detour": "vless-out"
+      }
+    ],
+    "auto_detect_interface": true
+  }
+}

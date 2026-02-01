@@ -1,0 +1,345 @@
+#!/bin/sh
+# VPN/Zapret Web Control Panel
+# Real tables: ip proxy_tproxy (chain prerouting), inet proxy_route (chain forward_zapret)
+
+STATE_FILE="/etc/vpn_state.json"
+NAMES_FILE="/etc/device_names.json"
+TPROXY_PORT="12345"
+
+# Читаем VPN_SERVER из конфига sing-box
+VPN_SERVER=$(grep -o '"server"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/sing-box/config_full_vpn.json | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"//')
+
+get_tproxy_port() {
+    case "$1" in
+        global_except_ru) echo "12346" ;;
+        *) echo "12345" ;;
+    esac
+}
+
+[ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
+[ -f "$NAMES_FILE" ] || echo '{}' > "$NAMES_FILE"
+
+# Read POST data
+if [ "$REQUEST_METHOD" = "POST" ]; then
+    read -r POST_DATA
+    QUERY_STRING="$POST_DATA"
+fi
+
+# Parse query string
+action="" ; mac="" ; name="" ; preset=""
+IFS='&' ; set -- $QUERY_STRING
+for param; do
+    key="${param%%=*}"
+    val="${param#*=}"
+    case "$key" in
+        action) action="$val" ;;
+        mac) mac="$(echo "$val" | sed 's/%3A/:/g; s/%3a/:/g')" ;;
+        name) name="$(echo "$val" | sed 's/+/ /g; s/%20/ /g; s/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g' | xargs -0 printf '%b' 2>/dev/null || echo "$val" | sed 's/+/ /g; s/%20/ /g')" ;;
+        preset) preset="$val" ;;
+    esac
+done
+unset IFS
+
+valid_mac() {
+    echo "$1" | grep -qiE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'
+}
+
+# JSON helpers
+get_vpn_state() {
+    grep -o "\"$1\"[^}]*" "$STATE_FILE" | grep -o '"vpn":[^,}]*' | grep -o '[^:]*$' | tr -d ' '
+}
+get_zapret_state() {
+    grep -o "\"$1\"[^}]*" "$STATE_FILE" | grep -o '"zapret":[^,}]*' | grep -o '[^:]*$' | tr -d ' '
+}
+get_preset_state() {
+    grep -o "\"$1\"[^}]*" "$STATE_FILE" | grep -o '"routing":"[^"]*"' | cut -d'"' -f4
+}
+get_device_name() {
+    grep -o "\"$1\":\"[^\"]*\"" "$NAMES_FILE" | head -1 | sed 's/.*:\"//; s/\"$//'
+}
+set_device_name() {
+    local m="$1" n="$2"
+    local tmp=$(sed "s/\"$m\":\"[^\"]*\",\\?//g; s/,}/}/g; s/{,/{/g" "$NAMES_FILE" | tr -d '\n' | sed 's/[[:space:]]//g')
+    [ "$tmp" = "{}" ] && tmp=""
+    if [ -z "$tmp" ] || [ "$tmp" = "{}" ]; then
+        echo "{\"$m\":\"$n\"}" > "$NAMES_FILE"
+    else
+        echo "${tmp%\}},\"$m\":\"$n\"}" > "$NAMES_FILE"
+    fi
+}
+set_state() {
+    local m="$1" vpn="$2" zapret="$3" routing="$4"
+    [ -z "$routing" ] && routing="full_vpn"
+    local tmp=$(sed "s/\"$m\":{[^}]*},\\?//g; s/,}/}/g; s/{,/{/g" "$STATE_FILE" | tr -d '\n' | sed 's/[[:space:]]//g')
+    [ "$tmp" = "{}" ] && tmp=""
+    if [ -z "$tmp" ] || [ "$tmp" = "{}" ]; then
+        echo "{\"$m\":{\"vpn\":$vpn,\"zapret\":$zapret,\"routing\":\"$routing\"}}" > "$STATE_FILE"
+    else
+        echo "${tmp%\}},\"$m\":{\"vpn\":$vpn,\"zapret\":$zapret,\"routing\":\"$routing\"}}" > "$STATE_FILE"
+    fi
+}
+
+# ===== NFT RULES (real tables) =====
+
+apply_vpn_on() {
+    local m="$1"
+    local port="${2:-$TPROXY_PORT}"
+    nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep -q "ether saddr $m" && return 0
+    nft add rule ip proxy_tproxy prerouting \
+        iifname "br-lan" ether saddr "$m" \
+        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+        meta l4proto tcp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
+    nft add rule ip proxy_tproxy prerouting \
+        iifname "br-lan" ether saddr "$m" \
+        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+        meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
+}
+
+apply_vpn_off() {
+    local m="$1"
+    nft -a list chain ip proxy_tproxy prerouting 2>/dev/null | \
+        tr '\n' ' ' | grep -oE "ether saddr $m[^#]*# handle [0-9]+" | \
+        grep -oE 'handle [0-9]+' | awk '{print $2}' | while read handle; do
+            nft delete rule ip proxy_tproxy prerouting handle "$handle" 2>/dev/null
+        done
+}
+
+apply_zapret_off() {
+    local m="$1"
+    nft list chain inet proxy_route forward_zapret 2>/dev/null | grep -q "ether saddr $m return" && return 0
+    nft insert rule inet proxy_route forward_zapret ether saddr "$m" return 2>/dev/null
+}
+
+apply_zapret_on() {
+    local m="$1"
+    nft -a list chain inet proxy_route forward_zapret 2>/dev/null | grep "ether saddr $m" | grep "return" | \
+        awk '{print $NF}' | while read handle; do
+            nft delete rule inet proxy_route forward_zapret handle "$handle" 2>/dev/null
+        done
+}
+
+# Handle actions
+if valid_mac "$mac" && [ -n "$action" ]; then
+    cur_vpn=$(get_vpn_state "$mac")
+    cur_zapret=$(get_zapret_state "$mac")
+    cur_preset=$(get_preset_state "$mac")
+    [ -z "$cur_vpn" ] && cur_vpn="false"
+    [ -z "$cur_zapret" ] && cur_zapret="true"
+    [ -z "$cur_preset" ] && cur_preset="full_vpn"
+
+    case "$action" in
+        vpn_on)
+            port=$(get_tproxy_port "$cur_preset")
+            apply_vpn_on "$mac" "$port"
+            set_state "$mac" "true" "$cur_zapret" "$cur_preset"
+            ;;
+        vpn_off)    apply_vpn_off "$mac"; set_state "$mac" "false" "$cur_zapret" "$cur_preset" ;;
+        zapret_on)  apply_zapret_on "$mac";  set_state "$mac" "$cur_vpn" "true" "$cur_preset" ;;
+        zapret_off) apply_zapret_off "$mac"; set_state "$mac" "$cur_vpn" "false" "$cur_preset" ;;
+        set_name)   set_device_name "$mac" "$name" ;;
+        set_routing)
+            if echo "$preset" | grep -qE '^(full_vpn|global_except_ru)$'; then
+                new_port=$(get_tproxy_port "$preset")
+                if nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep -q "ether saddr $mac"; then
+                    apply_vpn_off "$mac"
+                    apply_vpn_on "$mac" "$new_port"
+                fi
+                set_state "$mac" "$cur_vpn" "$cur_zapret" "$preset"
+            fi
+            ;;
+        add_device)
+            [ -n "$name" ] && set_device_name "$mac" "$name"
+            set_state "$mac" "false" "true" "full_vpn"
+            ;;
+        delete_device)
+            apply_vpn_off "$mac"
+            apply_zapret_on "$mac"
+            sed -i "s/\"$mac\":{[^}]*},\\?//g; s/,}/}/g; s/{,/{/g" "$STATE_FILE"
+            sed -i "s/\"$mac\":\"[^\"]*\",\\?//g; s/,}/}/g; s/{,/{/g" "$NAMES_FILE"
+            ;;
+    esac
+
+    echo "Status: 302 Found"
+    echo "Location: /cgi-bin/vpn"
+    echo ""
+    exit 0
+fi
+
+# Collect devices
+get_devices() {
+    [ -f /tmp/dhcp.leases ] && awk '{print tolower($2), $3, ($4 == "*" ? "" : $4)}' /tmp/dhcp.leases
+    ip neigh show 2>/dev/null | awk '/lladdr/ && $1 !~ /:/ {print tolower($5), $1, ""}'
+    grep -oE '"[0-9a-f:]{17}"' "$STATE_FILE" | tr -d '"' | while read m; do
+        echo "$m - -"
+    done
+}
+
+devices=$(get_devices | awk '!seen[$1]++ {print}')
+
+nft_vpn_macs=$(nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
+nft_zapret_skip=$(nft list chain inet proxy_route forward_zapret 2>/dev/null | grep "return" | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
+
+# --- HTML output ---
+echo "Content-Type: text/html; charset=utf-8"
+echo ""
+cat <<'HTMLHEAD'
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VPN / Zapret Control</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,system-ui,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:16px;max-width:800px;margin:0 auto}
+h1{text-align:center;margin-bottom:20px;font-size:1.4em;color:#00d2ff}
+.device{background:#16213e;border-radius:12px;padding:14px;margin-bottom:12px;display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.info{flex:1;min-width:150px}
+.hostname{font-weight:600;font-size:1.05em;color:#fff;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.edit-btn{background:none;border:none;color:#00d2ff;cursor:pointer;font-size:.75em;padding:2px 6px}
+.del-btn{background:none;border:none;color:#ff4444;cursor:pointer;font-size:.7em;padding:2px 6px}
+.name-input{background:#0f3460;border:1px solid #00d2ff;color:#fff;border-radius:6px;padding:4px 8px;font-size:.9em;width:140px}
+.name-save{background:#00d2ff;color:#000;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.8em;font-weight:600}
+.ip{color:#888;font-size:.85em}
+.mac{color:#666;font-size:.75em;font-family:monospace}
+.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.btn{padding:8px 16px;border:none;border-radius:8px;font-size:.85em;font-weight:600;cursor:pointer;text-decoration:none;text-align:center;min-width:90px;transition:background .2s}
+.btn-on{background:#00c853;color:#fff}
+.btn-off{background:#444;color:#aaa}
+.btn-on:hover{background:#00e676}
+.btn-off:hover{background:#555}
+.label{font-size:.7em;display:block;color:#888;margin-bottom:2px;text-transform:uppercase;letter-spacing:1px}
+.toggle{display:flex;flex-direction:column;align-items:center}
+.preset-select{background:#0f3460;color:#e0e0e0;border:1px solid #333;border-radius:8px;padding:6px 8px;font-size:.8em;cursor:pointer}
+.add-section{background:#16213e;border-radius:12px;padding:16px;margin-bottom:16px}
+.add-section h2{font-size:1em;color:#00d2ff;margin-bottom:10px}
+.add-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.add-input{background:#0f3460;border:1px solid #333;color:#fff;border-radius:8px;padding:8px 12px;font-size:.9em}
+.add-input:focus{border-color:#00d2ff;outline:none}
+.add-btn{background:#00d2ff;color:#000;border:none;border-radius:8px;padding:8px 16px;font-weight:600;cursor:pointer;font-size:.9em}
+.footer{text-align:center;margin-top:20px;color:#555;font-size:.8em}
+</style>
+<script>
+function editName(mac, current) {
+    var el = document.getElementById('name-' + mac.replace(/:/g, '-'));
+    el.innerHTML = '<form method="POST" action="/cgi-bin/vpn" style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">' +
+        '<input type="hidden" name="action" value="set_name">' +
+        '<input type="hidden" name="mac" value="' + mac + '">' +
+        '<input class="name-input" type="text" name="name" value="' + current + '" autofocus>' +
+        '<button class="name-save" type="submit">OK</button></form>';
+}
+function confirmDelete(mac, name) {
+    if (confirm('Remove ' + name + ' (' + mac + ')?')) {
+        window.location = '?action=delete_device&mac=' + mac.replace(/:/g, '%3A');
+    }
+}
+function changePreset(mac, preset) {
+    var form = document.createElement('form');
+    form.method = 'POST';
+    form.action = '/cgi-bin/vpn';
+    var fields = {action: 'set_routing', mac: mac, preset: preset};
+    for (var k in fields) {
+        var inp = document.createElement('input');
+        inp.type = 'hidden'; inp.name = k; inp.value = fields[k];
+        form.appendChild(inp);
+    }
+    document.body.appendChild(form);
+    form.submit();
+}
+</script>
+</head>
+<body>
+<h1>VPN / Zapret Control Panel</h1>
+<div class="add-section">
+<h2>+ Add device</h2>
+<form class="add-form" method="POST" action="/cgi-bin/vpn">
+<input type="hidden" name="action" value="add_device">
+<input class="add-input" type="text" name="mac" placeholder="MAC (aa:bb:cc:dd:ee:ff)" pattern="[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}" required style="width:220px">
+<input class="add-input" type="text" name="name" placeholder="Name" style="width:150px">
+<button class="add-btn" type="submit">Add</button>
+</form>
+</div>
+HTMLHEAD
+
+echo "$devices" | while read mac ip dhcp_name; do
+    [ -z "$mac" ] && continue
+    case "$ip" in 192.168.2.1|192.168.1.1) continue ;; esac
+    case "$ip" in *:*) continue ;; esac
+
+    custom_name=$(get_device_name "$mac")
+    if [ -n "$custom_name" ]; then
+        display_name="$custom_name"
+    elif [ -n "$dhcp_name" ] && [ "$dhcp_name" != "-" ]; then
+        display_name="$dhcp_name"
+    elif [ -n "$ip" ] && [ "$ip" != "-" ]; then
+        display_name="$ip"
+    else
+        display_name="$mac"
+    fi
+
+    vpn_st="false"
+    echo "$nft_vpn_macs" | grep -qi "$mac" && vpn_st="true"
+    zapret_st="true"
+    echo "$nft_zapret_skip" | grep -qi "$mac" && zapret_st="false"
+
+    dev_preset=$(get_preset_state "$mac")
+    [ -z "$dev_preset" ] && dev_preset="full_vpn"
+
+    if [ "$vpn_st" = "true" ]; then
+        vpn_class="btn-on"; vpn_text="VPN ON"; vpn_action="vpn_off"
+    else
+        vpn_class="btn-off"; vpn_text="VPN OFF"; vpn_action="vpn_on"
+    fi
+
+    if [ "$zapret_st" = "true" ]; then
+        zap_class="btn-on"; zap_text="DPI ON"; zap_action="zapret_off"
+    else
+        zap_class="btn-off"; zap_text="DPI OFF"; zap_action="zapret_on"
+    fi
+
+    enc_mac=$(echo "$mac" | sed 's/:/%3A/g')
+    safe_mac=$(echo "$mac" | sed 's/:/-/g')
+
+    if [ "$dev_preset" = "global_except_ru" ]; then
+        sel_full="" ; sel_global=" selected"
+    else
+        sel_full=" selected" ; sel_global=""
+    fi
+
+    cat <<EOF
+<div class="device">
+  <div class="info">
+    <div class="hostname" id="name-${safe_mac}">
+      ${display_name}
+      <span class="edit-btn" onclick="editName('${mac}','${display_name}')">edit</span>
+      <span class="del-btn" onclick="confirmDelete('${mac}','${display_name}')">x</span>
+    </div>
+    <div class="ip">${ip}</div>
+    <div class="mac">${mac}</div>
+  </div>
+  <div class="controls">
+    <div class="toggle">
+      <span class="label">VPN</span>
+      <a class="btn ${vpn_class}" href="?action=${vpn_action}&mac=${enc_mac}">${vpn_text}</a>
+    </div>
+    <div class="toggle">
+      <span class="label">Zapret</span>
+      <a class="btn ${zap_class}" href="?action=${zap_action}&mac=${enc_mac}">${zap_text}</a>
+    </div>
+    <div class="toggle">
+      <span class="label">Routing</span>
+      <select class="preset-select" onchange="changePreset('${mac}', this.value)">
+        <option value="full_vpn"${sel_full}>Full VPN</option>
+        <option value="global_except_ru"${sel_global}>Global -RU</option>
+      </select>
+    </div>
+  </div>
+</div>
+EOF
+done
+
+cat <<'HTMLFOOT'
+<div class="footer">Cudy VPN/Zapret Manager</div>
+</body>
+</html>
+HTMLFOOT
