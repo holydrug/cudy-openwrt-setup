@@ -11,6 +11,10 @@ nft list table ip proxy_tproxy >/dev/null 2>&1 || nft add table ip proxy_tproxy
 nft list chain ip proxy_tproxy prerouting >/dev/null 2>&1 || \
     nft add chain ip proxy_tproxy prerouting '{ type filter hook prerouting priority mangle; policy accept; }'
 
+# DHCP must bypass tproxy (broadcast 255.255.255.255 not in excluded ranges)
+nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep -q 'udp dport { 67, 68 }' || \
+    nft insert rule ip proxy_tproxy prerouting iifname "br-lan" udp dport '{ 67, 68 }' accept
+
 # Таблица для per-device zapret control
 nft list table inet proxy_route >/dev/null 2>&1 || nft add table inet proxy_route
 nft list chain inet proxy_route forward_zapret >/dev/null 2>&1 || \
