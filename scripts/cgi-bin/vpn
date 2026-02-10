@@ -473,6 +473,15 @@ case "$action" in
         echo ""
         exit 0
         ;;
+    rename_profile)
+        if [ -n "$profile_id" ] && [ -n "$name" ]; then
+            sed -i "s/\"id\":\"$profile_id\",\"name\":\"[^\"]*\"/\"id\":\"$profile_id\",\"name\":\"$name\"/" "$PROFILES_FILE"
+        fi
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/vpn"
+        echo ""
+        exit 0
+        ;;
 esac
 
 if valid_mac "$mac" && [ -n "$action" ]; then
@@ -655,6 +664,14 @@ function confirmDelete(mac, name) {
         window.location = '?action=delete_device&mac=' + mac.replace(/:/g, '%3A');
     }
 }
+function editProfileName(pid, current) {
+    var el = document.getElementById('pname-' + pid);
+    el.innerHTML = '<form method="POST" action="/cgi-bin/vpn" style="display:inline-flex;gap:4px;align-items:center">' +
+        '<input type="hidden" name="action" value="rename_profile">' +
+        '<input type="hidden" name="profile_id" value="' + pid + '">' +
+        '<input class="name-input" type="text" name="name" value="' + current + '" autofocus>' +
+        '<button class="name-save" type="submit">OK</button></form>';
+}
 function confirmDeleteProfile(pid, name) {
     if (confirm('Delete profile "' + name + '"? Devices will be reassigned to default.')) {
         window.location = '?action=delete_profile&profile_id=' + pid;
@@ -730,7 +747,7 @@ get_profile_ids | while read pid; do
     cat <<EOF
 <div class="profile-card">
   <div class="profile-info">
-    <div class="profile-name">${p_name}${default_badge} <span class="${status_class}">${status_text}</span></div>
+    <div class="profile-name" id="pname-${pid}"><span>${p_name}</span><span class="edit-btn" onclick="editProfileName('${pid}','${p_name}')">edit</span>${default_badge} <span class="${status_class}">${status_text}</span></div>
     <div class="profile-server">${p_server}:${p_server_port}</div>
     <div class="profile-ports">Ports: full=${p_port_full} global-ru=${p_port_global}</div>
   </div>
