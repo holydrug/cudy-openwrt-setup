@@ -59,9 +59,9 @@ The setup is router-agnostic — it works on any OpenWrt device as long as the r
 # On the router
 cd /tmp
 # Copy the repo to the router (scp, wget, etc.)
-scp -r user@host:cudy-openwrt-setup /tmp/cudy-openwrt-setup
+scp -r user@host:vpn-zapret-openwrt-setup /tmp/vpn-zapret-openwrt-setup
 
-cd /tmp/cudy-openwrt-setup
+cd /tmp/vpn-zapret-openwrt-setup
 sh setup.sh
 ```
 

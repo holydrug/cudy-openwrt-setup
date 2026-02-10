@@ -59,9 +59,9 @@
 # На роутере
 cd /tmp
 # Скопировать репозиторий на роутер (scp, wget, etc.)
-scp -r user@host:cudy-openwrt-setup /tmp/cudy-openwrt-setup
+scp -r user@host:vpn-zapret-openwrt-setup /tmp/vpn-zapret-openwrt-setup
 
-cd /tmp/cudy-openwrt-setup
+cd /tmp/vpn-zapret-openwrt-setup
 sh setup.sh
 ```
 
