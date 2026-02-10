@@ -1,23 +1,65 @@
 #!/bin/sh
-# VPN/Zapret Web Control Panel
+# VPN/Zapret Web Control Panel — Multi-Profile
 # Real tables: ip proxy_tproxy (chain prerouting), inet proxy_route (chain forward_zapret)
 
 STATE_FILE="/etc/vpn_state.json"
 NAMES_FILE="/etc/device_names.json"
-TPROXY_PORT="12345"
-
-# Read VPN_SERVER from sing-box config
-VPN_SERVER=$(grep -oE '"server"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' /etc/sing-box/config_full_vpn.json | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"$//')
-
-get_tproxy_port() {
-    case "$1" in
-        global_except_ru) echo "12346" ;;
-        *) echo "12345" ;;
-    esac
-}
+PROFILES_FILE="/etc/vless_profiles.json"
+TEMPLATES_DIR="/etc/sing-box/templates"
 
 [ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
 [ -f "$NAMES_FILE" ] || echo '{}' > "$NAMES_FILE"
+[ -f "$PROFILES_FILE" ] || echo '{"profiles":[],"default_profile_id":"","next_port":12345,"next_id":1}' > "$PROFILES_FILE"
+
+# ===== Profile helpers =====
+
+get_all_servers() {
+    grep -o '"server":"[^"]*"' "$PROFILES_FILE" | sed 's/"server":"//;s/"//' | sort -u | tr '\n' ',' | sed 's/,$//'
+}
+
+get_default_profile_id() {
+    grep -o '"default_profile_id":"[^"]*"' "$PROFILES_FILE" | head -1 | sed 's/.*"default_profile_id":"//;s/"//'
+}
+
+get_profile_port() {
+    local pid="$1" mode="$2"
+    local key
+    case "$mode" in
+        full_vpn) key="port_full_vpn" ;;
+        *) key="port_global_except_ru" ;;
+    esac
+    grep -o "\"id\":\"$pid\"[^}]*" "$PROFILES_FILE" | grep -o "\"$key\":[0-9]*" | head -1 | sed "s/\"$key\"://"
+}
+
+get_profile_field() {
+    local pid="$1" field="$2"
+    grep -o "\"id\":\"$pid\"[^}]*" "$PROFILES_FILE" | grep -o "\"$field\":\"[^\"]*\"" | head -1 | sed "s/\"$field\":\"//;s/\"//"
+}
+
+get_profile_ids() {
+    grep -o '"id":"[^"]*"' "$PROFILES_FILE" | sed 's/"id":"//;s/"//'
+}
+
+# Build VPN_SERVERS exclusion string from all profiles
+ALL_SERVERS=$(get_all_servers)
+if [ -n "$ALL_SERVERS" ]; then
+    VPN_EXCLUDE="10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $ALL_SERVERS"
+else
+    VPN_EXCLUDE="10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16"
+fi
+
+get_tproxy_port() {
+    local mac="$1"
+    local routing="$2"
+    local profile_id
+    profile_id=$(grep -o "\"$mac\":{[^}]*}" "$STATE_FILE" | grep -o '"profile_id":"[^"]*"' | cut -d'"' -f4)
+    [ -z "$profile_id" ] && profile_id=$(get_default_profile_id)
+    [ -z "$profile_id" ] && { echo "12345"; return; }
+    local port
+    port=$(get_profile_port "$profile_id" "$routing")
+    [ -z "$port" ] && port="12345"
+    echo "$port"
+}
 
 # Read POST data
 if [ "$REQUEST_METHOD" = "POST" ]; then
@@ -26,7 +68,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
 fi
 
 # Parse query string
-action="" ; mac="" ; name="" ; preset=""
+action="" ; mac="" ; name="" ; preset="" ; vless_uri="" ; profile_id=""
 IFS='&' ; set -- $QUERY_STRING
 for param; do
     key="${param%%=*}"
@@ -36,6 +78,8 @@ for param; do
         mac) mac="$(echo "$val" | sed 's/%3A/:/g; s/%3a/:/g')" ;;
         name) name="$(echo "$val" | sed 's/+/ /g; s/%20/ /g; s/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g' | xargs -0 printf '%b' 2>/dev/null || echo "$val" | sed 's/+/ /g; s/%20/ /g')" ;;
         preset) preset="$val" ;;
+        vless_uri) vless_uri="$(echo "$val" | sed 's/%3A/:/g; s/%3a/:/g; s/%40/@/g; s/%3F/?/g; s/%3f/?/g; s/%23/#/g; s/%26/\&/g; s/%3D/=/g; s/%3d/=/g; s/%2F/\//g; s/%2f/\//g; s/+/ /g')" ;;
+        profile_id) profile_id="$val" ;;
     esac
 done
 unset IFS
@@ -44,15 +88,109 @@ valid_mac() {
     echo "$1" | grep -qiE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'
 }
 
-# JSON helpers
+# ===== vless:// URI parser =====
+
+parse_vless_uri() {
+    local raw="$1"
+    local uri name_part query authority uuid hostport
+
+    # Strip vless:// prefix
+    uri="${raw#vless://}"
+
+    # Extract fragment (name)
+    case "$uri" in
+        *"#"*) P_NAME="${uri##*#}"; uri="${uri%%#*}" ;;
+        *) P_NAME="" ;;
+    esac
+    P_NAME=$(echo "$P_NAME" | sed 's/%20/ /g; s/+/ /g')
+
+    # Extract query string
+    case "$uri" in
+        *"?"*) query="${uri##*\?}"; authority="${uri%%\?*}" ;;
+        *) query=""; authority="$uri" ;;
+    esac
+
+    # Extract UUID, server, port
+    P_UUID="${authority%%@*}"
+    hostport="${authority##*@}"
+    P_SERVER="${hostport%:*}"
+    P_PORT="${hostport##*:}"
+
+    # Parse query params
+    P_PBK="" ; P_SID="" ; P_SNI="" ; P_FP="chrome" ; P_FLOW=""
+    local old_ifs="$IFS"
+    IFS='&'
+    for kv in $query; do
+        local k="${kv%%=*}" v="${kv#*=}"
+        case "$k" in
+            pbk) P_PBK="$v" ;;
+            sid) P_SID="$v" ;;
+            sni) P_SNI="$v" ;;
+            fp) P_FP="$v" ;;
+            flow) P_FLOW="$v" ;;
+        esac
+    done
+    IFS="$old_ifs"
+
+    [ -z "$P_FLOW" ] && P_FLOW="xtls-rprx-vision"
+    [ -z "$P_FP" ] && P_FP="chrome"
+    [ -z "$P_NAME" ] && P_NAME="$P_SERVER"
+
+    # Validate
+    [ -z "$P_UUID" ] && return 1
+    [ -z "$P_SERVER" ] && return 1
+    [ -z "$P_PORT" ] && return 1
+    [ -z "$P_PBK" ] && return 1
+    [ -z "$P_SID" ] && return 1
+    [ "$P_PORT" -ge 1 ] 2>/dev/null && [ "$P_PORT" -le 65535 ] 2>/dev/null || return 1
+    return 0
+}
+
+# ===== Generate sing-box configs from template =====
+
+generate_configs() {
+    local pid="$1" port_full="$2" port_global="$3"
+    local server="$4" server_port="$5" uuid="$6"
+    local pbk="$7" sid="$8" sni="$9"
+    shift 9
+    local fp="$1" flow="$2"
+
+    for mode in full_vpn global_except_ru; do
+        local tpl="$TEMPLATES_DIR/config_${mode}.tpl.json"
+        [ -f "$tpl" ] || continue
+        local listen_port
+        case "$mode" in
+            full_vpn) listen_port="$port_full" ;;
+            *) listen_port="$port_global" ;;
+        esac
+        sed \
+            -e "s|%%LISTEN_PORT%%|$listen_port|g" \
+            -e "s|%%PROFILE_ID%%|$pid|g" \
+            -e "s|%%VLESS_SERVER%%|$server|g" \
+            -e "s|%%VLESS_PORT%%|$server_port|g" \
+            -e "s|%%VLESS_UUID%%|$uuid|g" \
+            -e "s|%%REALITY_PUBLIC_KEY%%|$pbk|g" \
+            -e "s|%%REALITY_SHORT_ID%%|$sid|g" \
+            -e "s|%%REALITY_SNI%%|$sni|g" \
+            -e "s|%%TLS_FINGERPRINT%%|$fp|g" \
+            -e "s|%%VLESS_FLOW%%|$flow|g" \
+            "$tpl" > "/etc/sing-box/config_${mode}_${pid}.json"
+    done
+}
+
+# ===== JSON helpers =====
+
 get_vpn_state() {
-    grep -o "\"$1\"[^}]*" "$STATE_FILE" | grep -o '"vpn":[^,}]*' | grep -o '[^:]*$' | tr -d ' '
+    grep -o "\"$1\":{[^}]*}" "$STATE_FILE" | grep -o '"vpn":[^,}]*' | grep -o '[^:]*$' | tr -d ' '
 }
 get_zapret_state() {
-    grep -o "\"$1\"[^}]*" "$STATE_FILE" | grep -o '"zapret":[^,}]*' | grep -o '[^:]*$' | tr -d ' '
+    grep -o "\"$1\":{[^}]*}" "$STATE_FILE" | grep -o '"zapret":[^,}]*' | grep -o '[^:]*$' | tr -d ' '
 }
 get_preset_state() {
-    grep -o "\"$1\"[^}]*" "$STATE_FILE" | grep -o '"routing":"[^"]*"' | cut -d'"' -f4
+    grep -o "\"$1\":{[^}]*}" "$STATE_FILE" | grep -o '"routing":"[^"]*"' | cut -d'"' -f4
+}
+get_device_profile() {
+    grep -o "\"$1\":{[^}]*}" "$STATE_FILE" | grep -o '"profile_id":"[^"]*"' | cut -d'"' -f4
 }
 get_device_name() {
     grep -o "\"$1\":\"[^\"]*\"" "$NAMES_FILE" | head -1 | sed 's/.*:"//; s/"$//'
@@ -68,20 +206,20 @@ set_device_name() {
     fi
 }
 set_state() {
-    local m="$1" vpn="$2" zapret="$3" routing="$4"
+    local m="$1" vpn="$2" zapret="$3" routing="$4" pid="$5"
     [ -z "$routing" ] && routing="global_except_ru"
+    [ -z "$pid" ] && pid=$(get_default_profile_id)
     local tmp=$(sed "s/\"$m\":{[^}]*},\?//g; s/,}/}/g; s/{,/{/g" "$STATE_FILE" | tr -d '\n' | sed 's/[[:space:]]//g')
     [ "$tmp" = "{}" ] && tmp=""
     if [ -z "$tmp" ] || [ "$tmp" = "{}" ]; then
-        echo "{\"$m\":{\"vpn\":$vpn,\"zapret\":$zapret,\"routing\":\"$routing\"}}" > "$STATE_FILE"
+        echo "{\"$m\":{\"vpn\":$vpn,\"zapret\":$zapret,\"routing\":\"$routing\",\"profile_id\":\"$pid\"}}" > "$STATE_FILE"
     else
-        echo "${tmp%\}},\"$m\":{\"vpn\":$vpn,\"zapret\":$zapret,\"routing\":\"$routing\"}}" > "$STATE_FILE"
+        echo "${tmp%\}},\"$m\":{\"vpn\":$vpn,\"zapret\":$zapret,\"routing\":\"$routing\",\"profile_id\":\"$pid\"}}" > "$STATE_FILE"
     fi
 }
 
-# ===== NFT RULES (real tables) =====
+# ===== NFT RULES =====
 
-# Remove accept bypass rules for a MAC (non-tproxy accept rules)
 remove_bypass() {
     local m="$1"
     nft -a list chain ip proxy_tproxy prerouting 2>/dev/null | \
@@ -91,7 +229,6 @@ remove_bypass() {
         done
 }
 
-# Add accept bypass rule (so catch-all does not apply)
 add_bypass() {
     local m="$1"
     nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep "ether saddr $m" | grep -v "tproxy" | grep -q "accept" && return 0
@@ -99,23 +236,21 @@ add_bypass() {
         iifname "br-lan" ether saddr "$m" accept 2>/dev/null
 }
 
-# VPN ON: remove bypass, add tproxy rules (insert before catch-all)
 apply_vpn_on() {
     local m="$1"
-    local port="${2:-$TPROXY_PORT}"
+    local port="$2"
     remove_bypass "$m"
     nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep "ether saddr $m" | grep -q "tproxy" && return 0
     nft insert rule ip proxy_tproxy prerouting \
         iifname "br-lan" ether saddr "$m" \
-        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+        ip daddr != "{ $VPN_EXCLUDE }" \
         meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
     nft insert rule ip proxy_tproxy prerouting \
         iifname "br-lan" ether saddr "$m" \
-        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+        ip daddr != "{ $VPN_EXCLUDE }" \
         meta l4proto tcp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
 }
 
-# VPN OFF: remove tproxy rules, add bypass so catch-all does not apply
 apply_vpn_off() {
     local m="$1"
     nft -a list chain ip proxy_tproxy prerouting 2>/dev/null | \
@@ -140,53 +275,266 @@ apply_zapret_on() {
     nft insert rule inet proxy_route forward_zapret ether saddr "$m" accept 2>/dev/null
 }
 
-# Handle actions
+# Rebuild catch-all rule with current default profile
+rebuild_catchall() {
+    # Remove old catch-all rules (those without "ether saddr")
+    nft -a list chain ip proxy_tproxy prerouting 2>/dev/null | \
+        grep "tproxy" | grep -v "ether saddr" | \
+        grep -oE 'handle [0-9]+' | awk '{print $2}' | while read handle; do
+            nft delete rule ip proxy_tproxy prerouting handle "$handle" 2>/dev/null
+        done
+    # Remove old catch-all return rule for zapret
+    nft -a list chain inet proxy_route forward_zapret 2>/dev/null | \
+        grep "iifname" | grep "return" | grep -v "ether saddr" | \
+        grep -oE 'handle [0-9]+' | awk '{print $2}' | while read handle; do
+            nft delete rule inet proxy_route forward_zapret handle "$handle" 2>/dev/null
+        done
+
+    local def_pid=$(get_default_profile_id)
+    local port=$(get_profile_port "$def_pid" "global_except_ru")
+    [ -z "$port" ] && port="12346"
+
+    # Re-read ALL_SERVERS in case profiles changed
+    local all_srv=$(get_all_servers)
+    local excl="10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16"
+    [ -n "$all_srv" ] && excl="$excl, $all_srv"
+
+    nft add rule ip proxy_tproxy prerouting \
+        iifname "br-lan" \
+        ip daddr != "{ $excl }" \
+        meta l4proto tcp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
+    nft add rule ip proxy_tproxy prerouting \
+        iifname "br-lan" \
+        ip daddr != "{ $excl }" \
+        meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
+
+    nft add rule inet proxy_route forward_zapret iifname "br-lan" return 2>/dev/null
+}
+
+# ===== Profile CRUD actions =====
+
+do_add_profile() {
+    local uri="$1"
+    parse_vless_uri "$uri" || {
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/vpn?err=invalid_uri"
+        echo ""
+        exit 0
+    }
+
+    # Check max profiles
+    local count=$(grep -o '"id":"' "$PROFILES_FILE" | wc -l | tr -d ' ')
+    [ "$count" -ge 4 ] && {
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/vpn?err=max_profiles"
+        echo ""
+        exit 0
+    }
+
+    # Read next_port and next_id
+    local next_port=$(grep -o '"next_port":[0-9]*' "$PROFILES_FILE" | head -1 | sed 's/"next_port"://')
+    local next_id=$(grep -o '"next_id":[0-9]*' "$PROFILES_FILE" | head -1 | sed 's/"next_id"://')
+    [ -z "$next_port" ] && next_port=12345
+    [ -z "$next_id" ] && next_id=1
+
+    local pid="p${next_id}"
+    local port_full="$next_port"
+    local port_global=$((next_port + 1))
+    local new_next_port=$((next_port + 2))
+    local new_next_id=$((next_id + 1))
+
+    # Build new profile JSON entry
+    local entry="{\"id\":\"$pid\",\"name\":\"$P_NAME\",\"server\":\"$P_SERVER\",\"server_port\":$P_PORT,\"uuid\":\"$P_UUID\",\"public_key\":\"$P_PBK\",\"short_id\":\"$P_SID\",\"sni\":\"$P_SNI\",\"fingerprint\":\"$P_FP\",\"flow\":\"$P_FLOW\",\"port_full_vpn\":$port_full,\"port_global_except_ru\":$port_global}"
+
+    # Insert into profiles array
+    local old_profiles=$(grep -o '"profiles":\[[^]]*\]' "$PROFILES_FILE" | sed 's/"profiles":\[//;s/\]$//')
+    local new_profiles
+    if [ -z "$old_profiles" ]; then
+        new_profiles="$entry"
+    else
+        new_profiles="${old_profiles},${entry}"
+    fi
+
+    # Set default if first profile
+    local def_pid=$(get_default_profile_id)
+    [ -z "$def_pid" ] && def_pid="$pid"
+
+    echo "{\"profiles\":[$new_profiles],\"default_profile_id\":\"$def_pid\",\"next_port\":$new_next_port,\"next_id\":$new_next_id}" > "$PROFILES_FILE"
+
+    # Generate sing-box configs
+    generate_configs "$pid" "$port_full" "$port_global" \
+        "$P_SERVER" "$P_PORT" "$P_UUID" "$P_PBK" "$P_SID" "$P_SNI" "$P_FP" "$P_FLOW"
+
+    # Start new sing-box instances
+    /etc/init.d/sing-box restart 2>/dev/null
+
+    # Rebuild catch-all with updated server exclusion list
+    rebuild_catchall
+}
+
+do_delete_profile() {
+    local pid="$1"
+    local def_pid=$(get_default_profile_id)
+
+    # Cannot delete last profile
+    local count=$(grep -o '"id":"' "$PROFILES_FILE" | wc -l | tr -d ' ')
+    [ "$count" -le 1 ] && {
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/vpn?err=last_profile"
+        echo ""
+        exit 0
+    }
+
+    # Remove configs
+    rm -f "/etc/sing-box/config_full_vpn_${pid}.json"
+    rm -f "/etc/sing-box/config_global_except_ru_${pid}.json"
+    rm -f "/etc/sing-box/cache-full-${pid}.db"
+    rm -f "/etc/sing-box/cache-global-${pid}.db"
+
+    # Remove profile from JSON — rebuild without this profile
+    local new_profiles=""
+    get_profile_ids | while read id; do
+        [ "$id" = "$pid" ] && continue
+        local entry=$(grep -o "{\"id\":\"$id\"[^}]*}" "$PROFILES_FILE")
+        if [ -z "$new_profiles" ]; then
+            new_profiles="$entry"
+        else
+            new_profiles="${new_profiles},${entry}"
+        fi
+        # Use temp file to pass value out of subshell
+        echo "$new_profiles" > /tmp/vpn_cgi_profiles_tmp
+    done
+    new_profiles=$(cat /tmp/vpn_cgi_profiles_tmp 2>/dev/null)
+    rm -f /tmp/vpn_cgi_profiles_tmp
+
+    local next_port=$(grep -o '"next_port":[0-9]*' "$PROFILES_FILE" | head -1 | sed 's/"next_port"://')
+    local next_id=$(grep -o '"next_id":[0-9]*' "$PROFILES_FILE" | head -1 | sed 's/"next_id"://')
+
+    # If deleted profile was default, pick first remaining
+    local new_def="$def_pid"
+    if [ "$def_pid" = "$pid" ]; then
+        new_def=$(echo "$new_profiles" | grep -o '"id":"[^"]*"' | head -1 | sed 's/"id":"//;s/"//')
+    fi
+
+    echo "{\"profiles\":[$new_profiles],\"default_profile_id\":\"$new_def\",\"next_port\":$next_port,\"next_id\":$next_id}" > "$PROFILES_FILE"
+
+    # Reassign devices on deleted profile to default
+    grep -oE '"[0-9a-f:]{17}":\{[^}]*\}' "$STATE_FILE" | while IFS= read -r entry; do
+        local m=$(echo "$entry" | grep -oE '[0-9a-f:]{17}')
+        local p=$(echo "$entry" | grep -o '"profile_id":"[^"]*"' | cut -d'"' -f4)
+        if [ "$p" = "$pid" ]; then
+            local vpn_val=$(echo "$entry" | grep -o '"vpn":[a-z]*' | cut -d: -f2)
+            local zapret_val=$(echo "$entry" | grep -o '"zapret":[a-z]*' | cut -d: -f2)
+            local routing=$(echo "$entry" | grep -o '"routing":"[^"]*"' | cut -d'"' -f4)
+            set_state "$m" "$vpn_val" "$zapret_val" "$routing" "$new_def"
+            # Re-apply nft rules with new port
+            if [ "$vpn_val" = "true" ]; then
+                apply_vpn_off "$m"
+                remove_bypass "$m"
+                local port=$(get_profile_port "$new_def" "$routing")
+                apply_vpn_on "$m" "$port"
+            fi
+        fi
+    done
+
+    # Restart sing-box and rebuild catch-all
+    /etc/init.d/sing-box restart 2>/dev/null
+    rebuild_catchall
+}
+
+do_set_default_profile() {
+    local pid="$1"
+    local contents=$(cat "$PROFILES_FILE")
+    echo "$contents" | sed "s/\"default_profile_id\":\"[^\"]*\"/\"default_profile_id\":\"$pid\"/" > "$PROFILES_FILE"
+    rebuild_catchall
+}
+
+# ===== Handle actions =====
+
+case "$action" in
+    add_profile)
+        do_add_profile "$vless_uri"
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/vpn"
+        echo ""
+        exit 0
+        ;;
+    delete_profile)
+        do_delete_profile "$profile_id"
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/vpn"
+        echo ""
+        exit 0
+        ;;
+    set_default_profile)
+        do_set_default_profile "$profile_id"
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/vpn"
+        echo ""
+        exit 0
+        ;;
+esac
+
 if valid_mac "$mac" && [ -n "$action" ]; then
     cur_vpn=$(get_vpn_state "$mac")
     cur_zapret=$(get_zapret_state "$mac")
     cur_preset=$(get_preset_state "$mac")
+    cur_profile=$(get_device_profile "$mac")
     [ -z "$cur_vpn" ] && cur_vpn="true"
     [ -z "$cur_zapret" ] && cur_zapret="false"
     [ -z "$cur_preset" ] && cur_preset="global_except_ru"
+    [ -z "$cur_profile" ] && cur_profile=$(get_default_profile_id)
 
     case "$action" in
         vpn_on)
-            port=$(get_tproxy_port "$cur_preset")
+            port=$(get_tproxy_port "$mac" "$cur_preset")
             apply_vpn_on "$mac" "$port"
-            set_state "$mac" "true" "$cur_zapret" "$cur_preset"
+            set_state "$mac" "true" "$cur_zapret" "$cur_preset" "$cur_profile"
             ;;
         vpn_off)
             apply_vpn_off "$mac"
-            set_state "$mac" "false" "$cur_zapret" "$cur_preset"
+            set_state "$mac" "false" "$cur_zapret" "$cur_preset" "$cur_profile"
             ;;
         zapret_on)
             apply_zapret_on "$mac"
-            set_state "$mac" "$cur_vpn" "true" "$cur_preset"
+            set_state "$mac" "$cur_vpn" "true" "$cur_preset" "$cur_profile"
             ;;
         zapret_off)
             apply_zapret_off "$mac"
-            set_state "$mac" "$cur_vpn" "false" "$cur_preset"
+            set_state "$mac" "$cur_vpn" "false" "$cur_preset" "$cur_profile"
             ;;
         set_name)
             set_device_name "$mac" "$name"
             ;;
         set_routing)
             if echo "$preset" | grep -qE '^(full_vpn|global_except_ru)$'; then
-                new_port=$(get_tproxy_port "$preset")
+                new_port=$(get_tproxy_port "$mac" "$preset")
                 if nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep "ether saddr $mac" | grep -q "tproxy"; then
                     apply_vpn_off "$mac"
                     remove_bypass "$mac"
                     apply_vpn_on "$mac" "$new_port"
                 fi
-                set_state "$mac" "$cur_vpn" "$cur_zapret" "$preset"
+                set_state "$mac" "$cur_vpn" "$cur_zapret" "$preset" "$cur_profile"
+            fi
+            ;;
+        set_profile)
+            if [ -n "$profile_id" ]; then
+                new_port=$(get_profile_port "$profile_id" "$cur_preset")
+                if nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep "ether saddr $mac" | grep -q "tproxy"; then
+                    apply_vpn_off "$mac"
+                    remove_bypass "$mac"
+                    apply_vpn_on "$mac" "$new_port"
+                fi
+                set_state "$mac" "$cur_vpn" "$cur_zapret" "$cur_preset" "$profile_id"
             fi
             ;;
         add_device)
             [ -n "$name" ] && set_device_name "$mac" "$name"
-            port=$(get_tproxy_port "global_except_ru")
+            def_pid=$(get_default_profile_id)
+            port=$(get_tproxy_port "$mac" "global_except_ru")
             apply_vpn_on "$mac" "$port"
             apply_zapret_off "$mac"
-            set_state "$mac" "true" "false" "global_except_ru"
+            set_state "$mac" "true" "false" "global_except_ru" "$def_pid"
             ;;
         delete_device)
             apply_vpn_off "$mac"
@@ -203,7 +551,7 @@ if valid_mac "$mac" && [ -n "$action" ]; then
     exit 0
 fi
 
-# Collect devices
+# ===== Collect devices =====
 get_devices() {
     [ -f /tmp/dhcp.leases ] && awk '{print tolower($2), $3, ($4 == "*" ? "" : $4)}' /tmp/dhcp.leases
     ip neigh show 2>/dev/null | awk '/lladdr/ && $1 !~ /:/ {print tolower($5), $1, ""}'
@@ -221,6 +569,14 @@ nft_bypass_macs=$(echo "$nft_rules" | grep -v "tproxy" | grep "ether saddr" | gr
 nft_zapret_on=$(nft list chain inet proxy_route forward_zapret 2>/dev/null | grep "accept" | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
 has_catchall=$(echo "$nft_rules" | grep "tproxy" | grep -v "ether saddr" | grep -c "br-lan")
 
+# Parse error param
+err=""
+case "$QUERY_STRING" in
+    *err=invalid_uri*) err="Invalid vless:// URI" ;;
+    *err=max_profiles*) err="Maximum 4 profiles reached" ;;
+    *err=last_profile*) err="Cannot delete the last profile" ;;
+esac
+
 # --- HTML output ---
 echo "Content-Type: text/html; charset=utf-8"
 echo ""
@@ -235,6 +591,8 @@ cat <<'HTMLHEAD'
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,system-ui,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:16px;max-width:800px;margin:0 auto}
 h1{text-align:center;margin-bottom:20px;font-size:1.4em;color:#00d2ff}
+.section{background:#16213e;border-radius:12px;padding:14px;margin-bottom:12px}
+.section h2{font-size:1em;color:#00d2ff;margin-bottom:10px}
 .device{background:#16213e;border-radius:12px;padding:14px;margin-bottom:12px;display:flex;flex-wrap:wrap;align-items:center;gap:10px}
 .info{flex:1;min-width:150px}
 .hostname{font-weight:600;font-size:1.05em;color:#fff;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
@@ -254,17 +612,33 @@ h1{text-align:center;margin-bottom:20px;font-size:1.4em;color:#00d2ff}
 .btn-on:hover{background:#00e676}
 .btn-off:hover{background:#555}
 .btn-default:hover{background:#0a9e4f}
+.btn-sm{padding:6px 12px;font-size:.8em;min-width:auto}
+.btn-danger{background:#c62828;color:#fff}
+.btn-danger:hover{background:#e53935}
+.btn-primary{background:#00d2ff;color:#000}
+.btn-primary:hover{background:#33ddff}
 .label{font-size:.7em;display:block;color:#888;margin-bottom:2px;text-transform:uppercase;letter-spacing:1px}
 .toggle{display:flex;flex-direction:column;align-items:center}
 .preset-select{background:#0f3460;color:#e0e0e0;border:1px solid #333;border-radius:8px;padding:6px 8px;font-size:.8em;cursor:pointer}
 .preset-select:focus{border-color:#00d2ff;outline:none}
-.add-section{background:#16213e;border-radius:12px;padding:16px;margin-bottom:16px}
+.add-section{background:#16213e;border-radius:12px;padding:16px;margin-bottom:12px}
 .add-section h2{font-size:1em;color:#00d2ff;margin-bottom:10px}
 .add-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .add-input{background:#0f3460;border:1px solid #333;color:#fff;border-radius:8px;padding:8px 12px;font-size:.9em}
 .add-input:focus{border-color:#00d2ff;outline:none}
 .add-btn{background:#00d2ff;color:#000;border:none;border-radius:8px;padding:8px 16px;font-weight:600;cursor:pointer;font-size:.9em}
 .add-btn:hover{background:#33ddff}
+.profile-card{background:#0f3460;border-radius:8px;padding:10px 14px;margin-bottom:8px;display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.profile-info{flex:1;min-width:150px}
+.profile-name{font-weight:600;color:#fff}
+.profile-server{color:#888;font-size:.85em;font-family:monospace}
+.profile-ports{color:#666;font-size:.75em}
+.profile-actions{display:flex;gap:6px;flex-wrap:wrap}
+.status-up{color:#00c853;font-weight:600}
+.status-down{color:#ff4444;font-weight:600}
+.status-check{color:#888}
+.badge-default{background:#0f7c3f;color:#cfc;border-radius:4px;padding:2px 6px;font-size:.7em;font-weight:600;margin-left:6px}
+.error-msg{background:#c62828;color:#fff;border-radius:8px;padding:10px 14px;margin-bottom:12px;text-align:center}
 .footer{text-align:center;margin-top:20px;color:#555;font-size:.8em}
 </style>
 <script>
@@ -281,23 +655,99 @@ function confirmDelete(mac, name) {
         window.location = '?action=delete_device&mac=' + mac.replace(/:/g, '%3A');
     }
 }
+function confirmDeleteProfile(pid, name) {
+    if (confirm('Delete profile "' + name + '"? Devices will be reassigned to default.')) {
+        window.location = '?action=delete_profile&profile_id=' + pid;
+    }
+}
 function changePreset(mac, preset) {
     var form = document.createElement('form');
-    form.method = 'POST';
-    form.action = '/cgi-bin/vpn';
+    form.method = 'POST'; form.action = '/cgi-bin/vpn';
     var fields = {action: 'set_routing', mac: mac, preset: preset};
     for (var k in fields) {
         var inp = document.createElement('input');
         inp.type = 'hidden'; inp.name = k; inp.value = fields[k];
         form.appendChild(inp);
     }
-    document.body.appendChild(form);
-    form.submit();
+    document.body.appendChild(form); form.submit();
+}
+function changeProfile(mac, pid) {
+    var form = document.createElement('form');
+    form.method = 'POST'; form.action = '/cgi-bin/vpn';
+    var fields = {action: 'set_profile', mac: mac, profile_id: pid};
+    for (var k in fields) {
+        var inp = document.createElement('input');
+        inp.type = 'hidden'; inp.name = k; inp.value = fields[k];
+        form.appendChild(inp);
+    }
+    document.body.appendChild(form); form.submit();
 }
 </script>
 </head>
 <body>
 <h1>VPN / Zapret Control Panel</h1>
+HTMLHEAD
+
+# ===== Error message =====
+if [ -n "$err" ]; then
+    echo "<div class=\"error-msg\">$err</div>"
+fi
+
+# ===== Profiles section =====
+cat <<'PROFILEHEAD'
+<div class="section">
+<h2>VPN Profiles</h2>
+<form class="add-form" method="POST" action="/cgi-bin/vpn" style="margin-bottom:12px">
+<input type="hidden" name="action" value="add_profile">
+<input class="add-input" type="text" name="vless_uri" placeholder="vless://uuid@server:port?...#Name" required style="flex:1;min-width:250px">
+<button class="add-btn" type="submit">Add Profile</button>
+</form>
+PROFILEHEAD
+
+default_pid=$(get_default_profile_id)
+
+get_profile_ids | while read pid; do
+    p_name=$(get_profile_field "$pid" "name")
+    p_server=$(get_profile_field "$pid" "server")
+    p_port_full=$(get_profile_port "$pid" "full_vpn")
+    p_port_global=$(get_profile_port "$pid" "global_except_ru")
+    p_server_port=$(grep -o "\"id\":\"$pid\"[^}]*" "$PROFILES_FILE" | grep -o '"server_port":[0-9]*' | head -1 | sed 's/"server_port"://')
+
+    # Check server status via sing-box process
+    status_class="status-check"
+    status_text="..."
+    if pgrep -f "config_full_vpn_${pid}.json" >/dev/null 2>&1; then
+        status_class="status-up"
+        status_text="UP"
+    else
+        status_class="status-down"
+        status_text="DOWN"
+    fi
+
+    default_badge=""
+    [ "$pid" = "$default_pid" ] && default_badge='<span class="badge-default">DEFAULT</span>'
+
+    cat <<EOF
+<div class="profile-card">
+  <div class="profile-info">
+    <div class="profile-name">${p_name}${default_badge} <span class="${status_class}">${status_text}</span></div>
+    <div class="profile-server">${p_server}:${p_server_port}</div>
+    <div class="profile-ports">Ports: full=${p_port_full} global-ru=${p_port_global}</div>
+  </div>
+  <div class="profile-actions">
+EOF
+    if [ "$pid" != "$default_pid" ]; then
+        echo "    <a class=\"btn btn-sm btn-primary\" href=\"?action=set_default_profile&profile_id=${pid}\">Set Default</a>"
+        echo "    <span class=\"btn btn-sm btn-danger\" onclick=\"confirmDeleteProfile('${pid}','${p_name}')\">Delete</span>"
+    fi
+    echo "  </div>"
+    echo "</div>"
+done
+
+echo "</div>"
+
+# ===== Add device section =====
+cat <<'ADDDEVICE'
 <div class="add-section">
 <h2>+ Add device (default: VPN ON, Global -RU)</h2>
 <form class="add-form" method="POST" action="/cgi-bin/vpn">
@@ -307,8 +757,15 @@ function changePreset(mac, preset) {
 <button class="add-btn" type="submit">Add</button>
 </form>
 </div>
-HTMLHEAD
+ADDDEVICE
 
+# ===== Build profile list for select dropdown =====
+get_profile_ids | while read pid; do
+    p_name=$(get_profile_field "$pid" "name")
+    echo "$pid|$p_name"
+done > /tmp/vpn_cgi_profile_opts_$$
+
+# ===== Device list =====
 echo "$devices" | while read mac ip dhcp_name; do
     [ -z "$mac" ] && continue
     case "$ip" in 192.168.2.1|192.168.1.1) continue ;; esac
@@ -350,6 +807,9 @@ echo "$devices" | while read mac ip dhcp_name; do
     dev_preset=$(get_preset_state "$mac")
     [ -z "$dev_preset" ] && dev_preset="global_except_ru"
 
+    dev_profile=$(get_device_profile "$mac")
+    [ -z "$dev_profile" ] && dev_profile="$default_pid"
+
     if [ "$vpn_st" = "true" ]; then
         if [ -n "$is_default" ]; then
             vpn_class="btn-default"; vpn_text="DEFAULT"; vpn_action="vpn_off"
@@ -373,6 +833,27 @@ echo "$devices" | while read mac ip dhcp_name; do
         sel_full="" ; sel_global=" selected"
     else
         sel_full=" selected" ; sel_global=""
+    fi
+
+    # Build profile select options
+    profile_select=""
+    while IFS='|' read pid pname; do
+        [ -z "$pid" ] && continue
+        sel=""
+        [ "$pid" = "$dev_profile" ] && sel=" selected"
+        profile_select="${profile_select}<option value=\"${pid}\"${sel}>${pname}</option>"
+    done < /tmp/vpn_cgi_profile_opts_$$ 2>/dev/null
+
+    # Fallback: re-read if temp file gone
+    if [ -z "$profile_select" ]; then
+        get_profile_ids | while read pid; do
+            p_name=$(get_profile_field "$pid" "name")
+            sel=""
+            [ "$pid" = "$dev_profile" ] && sel=" selected"
+            printf '<option value="%s"%s>%s</option>' "$pid" "$sel" "$p_name"
+        done > /tmp/vpn_cgi_dev_select_$$
+        profile_select=$(cat /tmp/vpn_cgi_dev_select_$$ 2>/dev/null)
+        rm -f /tmp/vpn_cgi_dev_select_$$
     fi
 
     cat <<EOF
@@ -402,10 +883,18 @@ echo "$devices" | while read mac ip dhcp_name; do
         <option value="global_except_ru"${sel_global}>Global -RU</option>
       </select>
     </div>
+    <div class="toggle">
+      <span class="label">Profile</span>
+      <select class="preset-select" onchange="changeProfile('${mac}', this.value)">
+        ${profile_select}
+      </select>
+    </div>
   </div>
 </div>
 EOF
 done
+
+rm -f /tmp/vpn_cgi_profile_opts_$$
 
 cat <<'HTMLFOOT'
 <div class="footer">VPN/Zapret Manager | Default: VPN ON (Global -RU), DPI OFF</div>

@@ -28,7 +28,7 @@
       "type": "tproxy",
       "tag": "tproxy-in",
       "listen": "::",
-      "listen_port": 12345,
+      "listen_port": %%LISTEN_PORT%%,
       "sniff": true,
       "sniff_override_destination": false
     }
@@ -40,13 +40,13 @@
       "server": "%%VLESS_SERVER%%",
       "server_port": %%VLESS_PORT%%,
       "uuid": "%%VLESS_UUID%%",
-      "flow": "xtls-rprx-vision",
+      "flow": "%%VLESS_FLOW%%",
       "tls": {
         "enabled": true,
         "server_name": "%%REALITY_SNI%%",
         "utls": {
           "enabled": true,
-          "fingerprint": "chrome"
+          "fingerprint": "%%TLS_FINGERPRINT%%"
         },
         "reality": {
           "enabled": true,
@@ -60,6 +60,12 @@
       "tag": "direct"
     }
   ],
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "/etc/sing-box/cache-full-%%PROFILE_ID%%.db"
+    }
+  },
   "route": {
     "rules": [
       {

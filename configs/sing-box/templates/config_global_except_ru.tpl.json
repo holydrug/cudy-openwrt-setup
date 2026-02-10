@@ -32,7 +32,7 @@
       "type": "tproxy",
       "tag": "tproxy-in",
       "listen": "::",
-      "listen_port": 12346,
+      "listen_port": %%LISTEN_PORT%%,
       "sniff": true,
       "sniff_override_destination": false
     }
@@ -44,13 +44,13 @@
       "server": "%%VLESS_SERVER%%",
       "server_port": %%VLESS_PORT%%,
       "uuid": "%%VLESS_UUID%%",
-      "flow": "xtls-rprx-vision",
+      "flow": "%%VLESS_FLOW%%",
       "tls": {
         "enabled": true,
         "server_name": "%%REALITY_SNI%%",
         "utls": {
           "enabled": true,
-          "fingerprint": "chrome"
+          "fingerprint": "%%TLS_FINGERPRINT%%"
         },
         "reality": {
           "enabled": true,
@@ -67,7 +67,7 @@
   "experimental": {
     "cache_file": {
       "enabled": true,
-      "path": "/tmp/sing-box-cache-global.db"
+      "path": "/etc/sing-box/cache-global-%%PROFILE_ID%%.db"
     }
   },
   "route": {
@@ -83,18 +83,16 @@
     ],
     "rule_set": [
       {
-        "type": "remote",
+        "type": "local",
         "tag": "geoip-ru",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
-        "download_detour": "vless-out"
+        "path": "/etc/sing-box/rules/geoip-ru.srs"
       },
       {
-        "type": "remote",
+        "type": "local",
         "tag": "geosite-category-ru",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs",
-        "download_detour": "vless-out"
+        "path": "/etc/sing-box/rules/geosite-category-ru.srs"
       }
     ],
     "auto_detect_interface": true

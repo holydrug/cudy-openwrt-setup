@@ -2,6 +2,7 @@
 # Cudy WR3000 OpenWrt Setup Script
 # ash-compatible, idempotent
 # Usage: sh setup.sh
+# Supports vless:// URI or individual parameters
 
 set -e
 
@@ -17,27 +18,87 @@ log() { printf "${GREEN}[+]${NC} %s\n" "$1"; }
 warn() { printf "${RED}[!]${NC} %s\n" "$1"; }
 ask() { printf "${CYAN}[?]${NC} %s" "$1"; }
 
-# ===== Gather parameters =====
-if [ -z "$VLESS_SERVER" ]; then
-    ask "VLESS server IP: "; read VLESS_SERVER
-fi
-if [ -z "$VLESS_PORT" ]; then
-    ask "VLESS port [42832]: "; read VLESS_PORT
-    [ -z "$VLESS_PORT" ] && VLESS_PORT="42832"
-fi
-if [ -z "$VLESS_UUID" ]; then
-    ask "VLESS UUID: "; read VLESS_UUID
-fi
-if [ -z "$REALITY_PUBLIC_KEY" ]; then
-    ask "Reality public key: "; read REALITY_PUBLIC_KEY
-fi
-if [ -z "$REALITY_SHORT_ID" ]; then
-    ask "Reality short_id: "; read REALITY_SHORT_ID
-fi
-if [ -z "$REALITY_SNI" ]; then
-    ask "Reality SNI [www.icloud.com]: "; read REALITY_SNI
+# ===== vless:// URI parser =====
+parse_vless_uri() {
+    local raw="$1"
+    local uri query authority hostport
+
+    uri="${raw#vless://}"
+
+    case "$uri" in
+        *"#"*) VLESS_PROFILE_NAME="${uri##*#}"; uri="${uri%%#*}" ;;
+        *) VLESS_PROFILE_NAME="" ;;
+    esac
+    VLESS_PROFILE_NAME=$(echo "$VLESS_PROFILE_NAME" | sed 's/%20/ /g; s/+/ /g')
+
+    case "$uri" in
+        *"?"*) query="${uri##*\?}"; authority="${uri%%\?*}" ;;
+        *) query=""; authority="$uri" ;;
+    esac
+
+    VLESS_UUID="${authority%%@*}"
+    hostport="${authority##*@}"
+    VLESS_SERVER="${hostport%:*}"
+    VLESS_PORT="${hostport##*:}"
+
+    REALITY_PUBLIC_KEY="" ; REALITY_SHORT_ID="" ; REALITY_SNI="" ; TLS_FINGERPRINT="chrome" ; VLESS_FLOW=""
+    local old_ifs="$IFS"
+    IFS='&'
+    for kv in $query; do
+        local k="${kv%%=*}" v="${kv#*=}"
+        case "$k" in
+            pbk) REALITY_PUBLIC_KEY="$v" ;;
+            sid) REALITY_SHORT_ID="$v" ;;
+            sni) REALITY_SNI="$v" ;;
+            fp) TLS_FINGERPRINT="$v" ;;
+            flow) VLESS_FLOW="$v" ;;
+        esac
+    done
+    IFS="$old_ifs"
+
+    [ -z "$VLESS_FLOW" ] && VLESS_FLOW="xtls-rprx-vision"
+    [ -z "$TLS_FINGERPRINT" ] && TLS_FINGERPRINT="chrome"
+    [ -z "$VLESS_PROFILE_NAME" ] && VLESS_PROFILE_NAME="$VLESS_SERVER"
     [ -z "$REALITY_SNI" ] && REALITY_SNI="www.icloud.com"
+}
+
+# ===== Gather parameters =====
+
+# Check if vless:// URI is provided
+if [ -n "$VLESS_URI" ]; then
+    log "Parsing vless:// URI..."
+    parse_vless_uri "$VLESS_URI"
+else
+    ask "Enter vless:// URI (or press Enter for manual input): "; read VLESS_URI_INPUT
+    if [ -n "$VLESS_URI_INPUT" ]; then
+        parse_vless_uri "$VLESS_URI_INPUT"
+    else
+        if [ -z "$VLESS_SERVER" ]; then
+            ask "VLESS server IP: "; read VLESS_SERVER
+        fi
+        if [ -z "$VLESS_PORT" ]; then
+            ask "VLESS port [42832]: "; read VLESS_PORT
+            [ -z "$VLESS_PORT" ] && VLESS_PORT="42832"
+        fi
+        if [ -z "$VLESS_UUID" ]; then
+            ask "VLESS UUID: "; read VLESS_UUID
+        fi
+        if [ -z "$REALITY_PUBLIC_KEY" ]; then
+            ask "Reality public key: "; read REALITY_PUBLIC_KEY
+        fi
+        if [ -z "$REALITY_SHORT_ID" ]; then
+            ask "Reality short_id: "; read REALITY_SHORT_ID
+        fi
+        if [ -z "$REALITY_SNI" ]; then
+            ask "Reality SNI [www.icloud.com]: "; read REALITY_SNI
+            [ -z "$REALITY_SNI" ] && REALITY_SNI="www.icloud.com"
+        fi
+        [ -z "$TLS_FINGERPRINT" ] && TLS_FINGERPRINT="chrome"
+        [ -z "$VLESS_FLOW" ] && VLESS_FLOW="xtls-rprx-vision"
+        [ -z "$VLESS_PROFILE_NAME" ] && VLESS_PROFILE_NAME="$VLESS_SERVER"
+    fi
 fi
+
 if [ -z "$WIFI_SSID" ]; then
     ask "Wi-Fi SSID: "; read WIFI_SSID
 fi
@@ -78,33 +139,68 @@ else
     cd "$SCRIPT_DIR"
 fi
 
-# ===== 3. Deploy sing-box configs =====
-log "Deploying sing-box configs..."
-mkdir -p /etc/sing-box
+# ===== 3. Deploy sing-box templates and rule sets =====
+log "Deploying sing-box templates and rule sets..."
+mkdir -p /etc/sing-box/templates
+mkdir -p /etc/sing-box/rules
 
-for tpl in config_full_vpn.json config_global_except_ru.json; do
+cp "$SCRIPT_DIR/configs/sing-box/templates/config_full_vpn.tpl.json" /etc/sing-box/templates/
+cp "$SCRIPT_DIR/configs/sing-box/templates/config_global_except_ru.tpl.json" /etc/sing-box/templates/
+cp "$SCRIPT_DIR/configs/sing-box/rules/geoip-ru.srs" /etc/sing-box/rules/
+cp "$SCRIPT_DIR/configs/sing-box/rules/geosite-category-ru.srs" /etc/sing-box/rules/
+
+# ===== 4. Create initial vless_profiles.json =====
+log "Creating VLESS profiles..."
+PROFILES_FILE="/etc/vless_profiles.json"
+PROFILE_ID="p1"
+PORT_FULL=12345
+PORT_GLOBAL=12346
+
+echo "{\"profiles\":[{\"id\":\"$PROFILE_ID\",\"name\":\"$VLESS_PROFILE_NAME\",\"server\":\"$VLESS_SERVER\",\"server_port\":$VLESS_PORT,\"uuid\":\"$VLESS_UUID\",\"public_key\":\"$REALITY_PUBLIC_KEY\",\"short_id\":\"$REALITY_SHORT_ID\",\"sni\":\"$REALITY_SNI\",\"fingerprint\":\"$TLS_FINGERPRINT\",\"flow\":\"$VLESS_FLOW\",\"port_full_vpn\":$PORT_FULL,\"port_global_except_ru\":$PORT_GLOBAL}],\"default_profile_id\":\"$PROFILE_ID\",\"next_port\":12347,\"next_id\":2}" > "$PROFILES_FILE"
+
+# ===== 5. Generate sing-box configs from templates =====
+log "Generating sing-box configs for initial profile..."
+for mode in full_vpn global_except_ru; do
+    tpl="/etc/sing-box/templates/config_${mode}.tpl.json"
+    case "$mode" in
+        full_vpn) listen_port="$PORT_FULL" ;;
+        *) listen_port="$PORT_GLOBAL" ;;
+    esac
     sed \
+        -e "s|%%LISTEN_PORT%%|$listen_port|g" \
+        -e "s|%%PROFILE_ID%%|$PROFILE_ID|g" \
         -e "s|%%VLESS_SERVER%%|$VLESS_SERVER|g" \
         -e "s|%%VLESS_PORT%%|$VLESS_PORT|g" \
         -e "s|%%VLESS_UUID%%|$VLESS_UUID|g" \
         -e "s|%%REALITY_PUBLIC_KEY%%|$REALITY_PUBLIC_KEY|g" \
         -e "s|%%REALITY_SHORT_ID%%|$REALITY_SHORT_ID|g" \
         -e "s|%%REALITY_SNI%%|$REALITY_SNI|g" \
-        "$SCRIPT_DIR/configs/sing-box/$tpl" > "/etc/sing-box/$tpl"
+        -e "s|%%TLS_FINGERPRINT%%|$TLS_FINGERPRINT|g" \
+        -e "s|%%VLESS_FLOW%%|$VLESS_FLOW|g" \
+        "$tpl" > "/etc/sing-box/config_${mode}_${PROFILE_ID}.json"
 done
 
-# ===== 4. Deploy sing-box init.d =====
+# ===== 6. Deploy sing-box init.d =====
 log "Deploying sing-box init.d script..."
 cp "$SCRIPT_DIR/scripts/init.d/sing-box" /etc/init.d/sing-box
 chmod +x /etc/init.d/sing-box
 
-# ===== 5. Deploy zapret config and hostlist =====
+# ===== 7. Deploy update-rulesets script + cron =====
+log "Deploying rule set update script..."
+cp "$SCRIPT_DIR/scripts/update-rulesets.sh" /etc/sing-box/update-rulesets.sh
+chmod +x /etc/sing-box/update-rulesets.sh
+
+# Add weekly cron job (Monday 4:00 AM)
+CRON_LINE="0 4 * * 1 /etc/sing-box/update-rulesets.sh"
+(crontab -l 2>/dev/null | grep -v "update-rulesets.sh"; echo "$CRON_LINE") | crontab -
+
+# ===== 8. Deploy zapret config and hostlist =====
 log "Deploying zapret config..."
 cp "$SCRIPT_DIR/configs/zapret/config" "$ZAPRET_DIR/config"
 mkdir -p "$ZAPRET_DIR/ipset"
 cp "$SCRIPT_DIR/configs/zapret/zapret-hosts-user.txt" "$ZAPRET_DIR/ipset/zapret-hosts-user.txt"
 
-# ===== 6. Zapret symlinks =====
+# ===== 9. Zapret symlinks =====
 log "Setting up zapret symlinks..."
 if [ -f "$ZAPRET_DIR/init.d/sysv/zapret2" ]; then
     ln -sf "$ZAPRET_DIR/init.d/sysv/zapret2" /etc/init.d/zapret2
@@ -121,7 +217,7 @@ mkdir -p /etc/hotplug.d/iface
 [ -f "$ZAPRET_DIR/init.d/openwrt/90-zapret2" ] && \
     ln -sf "$ZAPRET_DIR/init.d/openwrt/90-zapret2" /etc/hotplug.d/iface/90-zapret2
 
-# ===== 7. Deploy CGI panel =====
+# ===== 10. Deploy CGI panel =====
 log "Deploying web control panel..."
 mkdir -p /www/cgi-bin
 cp "$SCRIPT_DIR/scripts/cgi-bin/vpn" /www/cgi-bin/vpn
@@ -131,13 +227,13 @@ chmod +x /www/cgi-bin/vpn
 [ -f /etc/vpn_state.json ] || echo '{}' > /etc/vpn_state.json
 [ -f /etc/device_names.json ] || echo '{}' > /etc/device_names.json
 
-# ===== 8. Setup nftables + ip rule =====
+# ===== 11. Setup nftables + ip rule =====
 log "Setting up nftables and ip rule..."
 cp "$SCRIPT_DIR/configs/nftables/proxy-tproxy.sh" /etc/proxy-tproxy.sh
 chmod +x /etc/proxy-tproxy.sh
 sh /etc/proxy-tproxy.sh
 
-# ===== 9. Configure Wi-Fi =====
+# ===== 12. Configure Wi-Fi =====
 log "Configuring Wi-Fi..."
 uci set wireless.radio0.disabled='0'
 uci set wireless.default_radio0.ssid="$WIFI_SSID"
@@ -151,13 +247,13 @@ uci set wireless.default_radio1.key="$WIFI_PASSWORD"
 
 uci commit wireless
 
-# ===== 10. Configure uhttpd for CGI =====
+# ===== 13. Configure uhttpd for CGI =====
 log "Configuring uhttpd..."
 uci set uhttpd.main.interpreter='.cgi=/bin/sh'
 uci add_list uhttpd.main.cgi_prefix='/cgi-bin' 2>/dev/null || true
 uci commit uhttpd
 
-# ===== 11. Create boot script for nftables/ip rule =====
+# ===== 14. Create boot script for nftables/ip rule =====
 log "Creating boot autostart script..."
 cat > /etc/init.d/proxy-routing <<'INITEOF'
 #!/bin/sh /etc/rc.common
@@ -168,12 +264,30 @@ STOP=10
 USE_PROCD=1
 
 STATE_FILE="/etc/vpn_state.json"
-TPROXY_PORT="12345"
-DEFAULT_VPN_PORT="12346"
+PROFILES_FILE="/etc/vless_profiles.json"
+
+get_all_servers() {
+    grep -o '"server":"[^"]*"' "$PROFILES_FILE" | sed 's/"server":"//;s/"//' | sort -u | tr '\n' ',' | sed 's/,$//'
+}
+
+get_default_profile_id() {
+    grep -o '"default_profile_id":"[^"]*"' "$PROFILES_FILE" | head -1 | sed 's/.*"default_profile_id":"//;s/"//'
+}
+
+get_profile_port() {
+    local pid="$1" mode="$2" key
+    case "$mode" in
+        full_vpn) key="port_full_vpn" ;;
+        *) key="port_global_except_ru" ;;
+    esac
+    grep -o "\"id\":\"$pid\"[^}]*" "$PROFILES_FILE" | grep -o "\"$key\":[0-9]*" | head -1 | sed "s/\"$key\"://"
+}
 
 start_service() {
-    VPN_SERVER=$(grep -oE '"server"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' /etc/sing-box/config_full_vpn.json 2>/dev/null | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"//')
-    [ -z "$VPN_SERVER" ] && { logger -t proxy-routing "No VPN_SERVER found, aborting"; return 1; }
+    ALL_SERVERS=$(get_all_servers)
+    [ -z "$ALL_SERVERS" ] && { logger -t proxy-routing "No VPN servers found, aborting"; return 1; }
+
+    VPN_EXCLUDE="10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $ALL_SERVERS"
 
     # Create nftables tables and chains
     nft add table ip proxy_tproxy 2>/dev/null
@@ -204,7 +318,11 @@ stop_service() {
 }
 
 restore_state() {
-    VPN_SERVER=$(grep -oE '"server"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' /etc/sing-box/config_full_vpn.json 2>/dev/null | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"//')
+    ALL_SERVERS=$(get_all_servers)
+    VPN_EXCLUDE="10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16"
+    [ -n "$ALL_SERVERS" ] && VPN_EXCLUDE="$VPN_EXCLUDE, $ALL_SERVERS"
+
+    DEFAULT_PID=$(get_default_profile_id)
 
     [ -f "$STATE_FILE" ] || {
         add_catchall
@@ -216,20 +334,26 @@ restore_state() {
         vpn_val=$(echo "$entry" | grep -o '"vpn":[a-z]*' | cut -d: -f2)
         zapret_val=$(echo "$entry" | grep -o '"zapret":[a-z]*' | cut -d: -f2)
         routing=$(echo "$entry" | grep -o '"routing":"[^"]*"' | cut -d'"' -f4)
+        profile_id=$(echo "$entry" | grep -o '"profile_id":"[^"]*"' | cut -d'"' -f4)
 
-        case "$routing" in
-            global_except_ru) port=12346 ;;
-            *) port=12345 ;;
-        esac
+        [ -z "$profile_id" ] && profile_id="$DEFAULT_PID"
+
+        port=$(get_profile_port "$profile_id" "$routing")
+        [ -z "$port" ] && {
+            case "$routing" in
+                global_except_ru) port=12346 ;;
+                *) port=12345 ;;
+            esac
+        }
 
         if [ "$vpn_val" = "true" ]; then
             nft add rule ip proxy_tproxy prerouting \
                 iifname "br-lan" ether saddr "$mac" \
-                ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+                ip daddr != "{ $VPN_EXCLUDE }" \
                 meta l4proto tcp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
             nft add rule ip proxy_tproxy prerouting \
                 iifname "br-lan" ether saddr "$mac" \
-                ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+                ip daddr != "{ $VPN_EXCLUDE }" \
                 meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
         elif [ "$vpn_val" = "false" ]; then
             nft add rule ip proxy_tproxy prerouting \
@@ -245,15 +369,21 @@ restore_state() {
 }
 
 add_catchall() {
-    VPN_SERVER=$(grep -oE '"server"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' /etc/sing-box/config_full_vpn.json 2>/dev/null | head -1 | sed 's/.*"server"[[:space:]]*:[[:space:]]*"//; s/"//')
+    ALL_SERVERS=$(get_all_servers)
+    VPN_EXCLUDE="10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16"
+    [ -n "$ALL_SERVERS" ] && VPN_EXCLUDE="$VPN_EXCLUDE, $ALL_SERVERS"
+
+    DEFAULT_PID=$(get_default_profile_id)
+    DEFAULT_VPN_PORT=$(get_profile_port "$DEFAULT_PID" "global_except_ru")
+    [ -z "$DEFAULT_VPN_PORT" ] && DEFAULT_VPN_PORT=12346
 
     nft add rule ip proxy_tproxy prerouting \
         iifname "br-lan" \
-        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+        ip daddr != "{ $VPN_EXCLUDE }" \
         meta l4proto tcp tproxy to :$DEFAULT_VPN_PORT meta mark set 0x1 accept 2>/dev/null
     nft add rule ip proxy_tproxy prerouting \
         iifname "br-lan" \
-        ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $VPN_SERVER }" \
+        ip daddr != "{ $VPN_EXCLUDE }" \
         meta l4proto udp tproxy to :$DEFAULT_VPN_PORT meta mark set 0x1 accept 2>/dev/null
     logger -t proxy-routing "Catch-all VPN (port $DEFAULT_VPN_PORT, global_except_ru) enabled"
 
@@ -264,7 +394,7 @@ add_catchall() {
 INITEOF
 chmod +x /etc/init.d/proxy-routing
 
-# ===== 12. Enable and start services =====
+# ===== 15. Enable and start services =====
 log "Enabling and starting services..."
 
 /etc/init.d/proxy-routing enable
