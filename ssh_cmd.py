@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Helper to run SSH commands on the router with password auth."""
+import os
 import sys
 import paramiko
 
-def run(cmd, host="192.168.2.1", user="root", password="root", timeout=10):
+def run(cmd, host=None, user="root", password="root", timeout=10):
+    if host is None:
+        host = os.environ.get("ROUTER_IP", "192.168.1.1")
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -24,7 +27,11 @@ def run(cmd, host="192.168.2.1", user="root", password="root", timeout=10):
         client.close()
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: ssh_cmd.py <command>", file=sys.stderr)
+    args = sys.argv[1:]
+    host = None
+    if args and args[0].startswith("--host="):
+        host = args.pop(0).split("=", 1)[1]
+    if not args:
+        print("Usage: ssh_cmd.py [--host=IP] <command>", file=sys.stderr)
         sys.exit(1)
-    run(" ".join(sys.argv[1:]))
+    run(" ".join(args), host=host)

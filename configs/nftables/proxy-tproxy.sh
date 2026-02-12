@@ -2,6 +2,8 @@
 # Создание nftables таблиц для tproxy и zapret per-device control
 # Вызывается из setup.sh и из автозапуска после ребута
 
+LAN_IFACE=$(cat /etc/vpn_lan_iface 2>/dev/null || echo "br-lan")
+
 # ip rule и route для tproxy
 ip rule show | grep -q "fwmark 0x1 lookup 100" || ip rule add fwmark 0x1 lookup 100
 ip route show table 100 2>/dev/null | grep -q "local default" || ip route add local default dev lo table 100
@@ -13,7 +15,7 @@ nft list chain ip proxy_tproxy prerouting >/dev/null 2>&1 || \
 
 # DHCP must bypass tproxy (broadcast 255.255.255.255 not in excluded ranges)
 nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep -q 'udp dport { 67, 68 }' || \
-    nft insert rule ip proxy_tproxy prerouting iifname "br-lan" udp dport '{ 67, 68 }' accept
+    nft insert rule ip proxy_tproxy prerouting iifname "$LAN_IFACE" udp dport '{ 67, 68 }' accept
 
 # Таблица для per-device zapret control
 nft list table inet proxy_route >/dev/null 2>&1 || nft add table inet proxy_route

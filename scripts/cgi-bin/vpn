@@ -6,6 +6,8 @@ STATE_FILE="/etc/vpn_state.json"
 NAMES_FILE="/etc/device_names.json"
 PROFILES_FILE="/etc/vless_profiles.json"
 TEMPLATES_DIR="/etc/sing-box/templates"
+LAN_IFACE=$(cat /etc/vpn_lan_iface 2>/dev/null || echo "br-lan")
+ROUTER_IP=$(uci get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
 
 [ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
 [ -f "$NAMES_FILE" ] || echo '{}' > "$NAMES_FILE"
@@ -274,7 +276,7 @@ add_bypass() {
     local m="$1"
     nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep "ether saddr $m" | grep -v "tproxy" | grep -q "accept" && return 0
     nft insert rule ip proxy_tproxy prerouting \
-        iifname "br-lan" ether saddr "$m" accept 2>/dev/null
+        iifname "$LAN_IFACE" ether saddr "$m" accept 2>/dev/null
 }
 
 apply_vpn_on() {
@@ -283,11 +285,11 @@ apply_vpn_on() {
     remove_bypass "$m"
     nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep "ether saddr $m" | grep -q "tproxy" && return 0
     nft insert rule ip proxy_tproxy prerouting \
-        iifname "br-lan" ether saddr "$m" \
+        iifname "$LAN_IFACE" ether saddr "$m" \
         ip daddr != "{ $VPN_EXCLUDE }" \
         meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
     nft insert rule ip proxy_tproxy prerouting \
-        iifname "br-lan" ether saddr "$m" \
+        iifname "$LAN_IFACE" ether saddr "$m" \
         ip daddr != "{ $VPN_EXCLUDE }" \
         meta l4proto tcp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
 }
@@ -341,15 +343,15 @@ rebuild_catchall() {
     [ -n "$all_srv" ] && excl="$excl, $all_srv"
 
     nft add rule ip proxy_tproxy prerouting \
-        iifname "br-lan" \
+        iifname "$LAN_IFACE" \
         ip daddr != "{ $excl }" \
         meta l4proto tcp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
     nft add rule ip proxy_tproxy prerouting \
-        iifname "br-lan" \
+        iifname "$LAN_IFACE" \
         ip daddr != "{ $excl }" \
         meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
 
-    nft add rule inet proxy_route forward_zapret iifname "br-lan" return 2>/dev/null
+    nft add rule inet proxy_route forward_zapret iifname "$LAN_IFACE" return 2>/dev/null
 }
 
 # Auto-update default profile when no devices remain on current default
@@ -358,7 +360,7 @@ auto_update_default() {
     local cur_default=$(get_default_profile_id)
     [ "$new_pid" = "$cur_default" ] && return 0
     # If any device still uses the current default, keep it
-    grep -q "\"profile_id\":\"$cur_default\"" "$STATE_FILE" && return 0
+    grep -q "\"profile_id\":\"$cur_default\"[,\"}]" "$STATE_FILE" && return 0
     # No devices on old default — switch default and rebuild catch-all
     sed -i "s/\"default_profile_id\":\"[^\"]*\"/\"default_profile_id\":\"$new_pid\"/" "$PROFILES_FILE"
     rebuild_catchall
@@ -446,7 +448,8 @@ do_delete_profile() {
 
     # Remove profile from JSON — rebuild without this profile
     local new_profiles=""
-    get_profile_ids | while read id; do
+    get_profile_ids > /tmp/vpn_cgi_pids_$$
+    while read id; do
         [ "$id" = "$pid" ] && continue
         local entry=$(grep -o "{\"id\":\"$id\"[^}]*}" "$PROFILES_FILE")
         if [ -z "$new_profiles" ]; then
@@ -454,11 +457,8 @@ do_delete_profile() {
         else
             new_profiles="${new_profiles},${entry}"
         fi
-        # Use temp file to pass value out of subshell
-        echo "$new_profiles" > /tmp/vpn_cgi_profiles_tmp
-    done
-    new_profiles=$(cat /tmp/vpn_cgi_profiles_tmp 2>/dev/null)
-    rm -f /tmp/vpn_cgi_profiles_tmp
+    done < /tmp/vpn_cgi_pids_$$
+    rm -f /tmp/vpn_cgi_pids_$$
 
     local next_port=$(grep -o '"next_port":[0-9]*' "$PROFILES_FILE" | head -1 | sed 's/"next_port"://')
     local next_id=$(grep -o '"next_id":[0-9]*' "$PROFILES_FILE" | head -1 | sed 's/"next_id"://')
@@ -630,7 +630,7 @@ nft_rules=$(nft list chain ip proxy_tproxy prerouting 2>/dev/null)
 nft_vpn_macs=$(echo "$nft_rules" | grep "tproxy" | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
 nft_bypass_macs=$(echo "$nft_rules" | grep -v "tproxy" | grep "ether saddr" | grep "accept" | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
 nft_zapret_on=$(nft list chain inet proxy_route forward_zapret 2>/dev/null | grep "accept" | grep -oE 'ether saddr [0-9a-f:]+' | awk '{print $3}' | sort -u)
-has_catchall=$(echo "$nft_rules" | grep "tproxy" | grep -v "ether saddr" | grep -c "br-lan")
+has_catchall=$(echo "$nft_rules" | grep "tproxy" | grep -v "ether saddr" | grep -c "$LAN_IFACE")
 
 # Parse error param
 err=""
@@ -841,7 +841,7 @@ done > /tmp/vpn_cgi_profile_opts_$$
 # ===== Device list =====
 echo "$devices" | while read mac ip dhcp_name; do
     [ -z "$mac" ] && continue
-    case "$ip" in 192.168.2.1|192.168.1.1) continue ;; esac
+    case "$ip" in "$ROUTER_IP") continue ;; esac
     case "$ip" in *:*) continue ;; esac
 
     custom_name=$(get_device_name "$mac")
