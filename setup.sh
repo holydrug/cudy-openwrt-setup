@@ -1,5 +1,5 @@
 #!/bin/sh
-# Cudy WR3000 OpenWrt Setup Script
+# OpenWrt VPN Setup Script (universal)
 # ash-compatible, idempotent
 # Usage: sh setup.sh
 # Supports vless:// URI or individual parameters
@@ -7,6 +7,11 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ===== Detect LAN interface and router IP =====
+LAN_IFACE=$(uci get network.lan.device 2>/dev/null || echo "br-lan")
+ROUTER_IP=$(uci get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+echo "$LAN_IFACE" > /etc/vpn_lan_iface
 
 # ===== Colors =====
 RED='\033[0;31m'
@@ -17,6 +22,63 @@ NC='\033[0m'
 log() { printf "${GREEN}[+]${NC} %s\n" "$1"; }
 warn() { printf "${RED}[!]${NC} %s\n" "$1"; }
 ask() { printf "${CYAN}[?]${NC} %s" "$1"; }
+
+# Copy file and strip Windows line endings (CRLF → LF)
+deploy() { cp "$1" "$2" && sed -i 's/\r$//' "$2"; }
+
+# ===== Disk space check =====
+check_space() {
+    local required_mb="$1"
+    local target="$2"  # mount point to check, e.g. / or /mnt/usb
+    local avail_kb
+    avail_kb=$(df "$target" 2>/dev/null | awk 'NR==2{print $4}')
+    [ -z "$avail_kb" ] && return 0  # can't determine, proceed
+    local avail_mb=$((avail_kb / 1024))
+    if [ "$avail_mb" -lt "$required_mb" ]; then
+        warn "Not enough space on $target: ${avail_mb}MB available, ${required_mb}MB required"
+        return 1
+    fi
+    log "Space OK: ${avail_mb}MB available on $target (need ${required_mb}MB)"
+    return 0
+}
+
+# ===== Setup mode selection =====
+# Can be overridden via env: SETUP_MODE=full|vpn-only|full-git
+if [ -z "$SETUP_MODE" ]; then
+    echo ""
+    echo "=== Installation variants ==="
+    echo "  1) full       - VPN + DPI bypass (zapret)  [~18 MB]  (recommended)"
+    echo "  2) vpn-only   - VPN only, no zapret        [~15 MB]"
+    echo "  3) full-git   - VPN + zapret via git clone  [~48 MB]"
+    echo ""
+    ask "Select variant [1]: "; read MODE_CHOICE
+    case "$MODE_CHOICE" in
+        2) SETUP_MODE="vpn-only" ;;
+        3) SETUP_MODE="full-git" ;;
+        *) SETUP_MODE="full" ;;
+    esac
+fi
+log "Setup mode: $SETUP_MODE"
+
+# Determine space requirement
+case "$SETUP_MODE" in
+    vpn-only)   REQUIRED_MB=20 ;;
+    full-git)   REQUIRED_MB=55 ;;
+    *)          REQUIRED_MB=25 ;;
+esac
+
+# Check space on target filesystem
+if mount | grep -q '/mnt/usb' && [ -w /mnt/usb ]; then
+    INSTALL_TARGET="/mnt/usb"
+else
+    INSTALL_TARGET="/"
+fi
+
+if ! check_space "$REQUIRED_MB" "$INSTALL_TARGET"; then
+    warn "Insufficient disk space for '$SETUP_MODE' variant."
+    warn "Options: use a smaller variant, free space, or plug in a USB drive."
+    exit 1
+fi
 
 # ===== vless:// URI parser =====
 parse_vless_uri() {
@@ -143,21 +205,53 @@ fi
 # ===== 1. Install packages =====
 log "Installing packages..."
 opkg update
-opkg install sing-box kmod-nft-tproxy kmod-nf-tproxy kmod-inet-diag ip-full curl git-http
 
-# ===== 2. Clone zapret to USB =====
-ZAPRET_DIR="/mnt/usb/zapret2"
-if [ ! -d "$ZAPRET_DIR/.git" ]; then
-    log "Cloning zapret to $ZAPRET_DIR..."
-    if [ -d "$ZAPRET_DIR" ]; then
-        warn "$ZAPRET_DIR exists but is not a git repo, backing up..."
-        mv "$ZAPRET_DIR" "${ZAPRET_DIR}.bak.$(date +%s)"
+# Base packages (always needed)
+opkg install sing-box kmod-nft-tproxy kmod-nf-tproxy kmod-inet-diag ip-full curl
+
+# Git only needed for full-git mode
+if [ "$SETUP_MODE" = "full-git" ]; then
+    opkg install git-http
+fi
+
+# ===== 2. Install zapret (conditional on SETUP_MODE) =====
+if [ "$SETUP_MODE" != "vpn-only" ]; then
+    # Determine zapret directory
+    if mount | grep -q '/mnt/usb' && [ -w /mnt/usb ]; then
+        ZAPRET_DIR="/mnt/usb/zapret2"
+    else
+        ZAPRET_DIR="/opt/zapret"
+        mkdir -p /opt
     fi
-    git clone https://github.com/bol-van/zapret "$ZAPRET_DIR"
+    echo "$ZAPRET_DIR" > /etc/vpn_zapret_dir
+
+    if [ "$SETUP_MODE" = "full-git" ]; then
+        # Git clone (supports git pull updates later)
+        if [ ! -d "$ZAPRET_DIR/.git" ]; then
+            log "Cloning zapret to $ZAPRET_DIR..."
+            [ -d "$ZAPRET_DIR" ] && mv "$ZAPRET_DIR" "${ZAPRET_DIR}.bak.$(date +%s)"
+            git clone https://github.com/bol-van/zapret "$ZAPRET_DIR"
+        else
+            log "zapret already cloned, pulling updates..."
+            cd "$ZAPRET_DIR" && git pull || true
+            cd "$SCRIPT_DIR"
+        fi
+    else
+        # Tarball download (saves ~30 MB, no git needed)
+        if [ ! -d "$ZAPRET_DIR" ] || [ ! -f "$ZAPRET_DIR/init.d/sysv/zapret" ]; then
+            log "Downloading zapret tarball to $ZAPRET_DIR..."
+            [ -d "$ZAPRET_DIR" ] && mv "$ZAPRET_DIR" "${ZAPRET_DIR}.bak.$(date +%s)"
+            mkdir -p "$ZAPRET_DIR"
+            curl -sL "https://github.com/bol-van/zapret/archive/refs/heads/master.tar.gz" | \
+                tar xz -C "$ZAPRET_DIR" --strip-components=1
+        else
+            log "zapret already present at $ZAPRET_DIR, skipping download"
+        fi
+    fi
 else
-    log "zapret already cloned, pulling updates..."
-    cd "$ZAPRET_DIR" && git pull || true
-    cd "$SCRIPT_DIR"
+    log "Skipping zapret (vpn-only mode)"
+    # Write empty marker so other scripts know zapret is not installed
+    echo "" > /etc/vpn_zapret_dir
 fi
 
 # ===== 3. Deploy sing-box templates and rule sets =====
@@ -165,21 +259,28 @@ log "Deploying sing-box templates and rule sets..."
 mkdir -p /etc/sing-box/templates
 mkdir -p /etc/sing-box/rules
 
-cp "$SCRIPT_DIR/configs/sing-box/templates/config_full_vpn.tpl.json" /etc/sing-box/templates/
-cp "$SCRIPT_DIR/configs/sing-box/templates/config_global_except_ru.tpl.json" /etc/sing-box/templates/
+deploy "$SCRIPT_DIR/configs/sing-box/templates/config_full_vpn.tpl.json" /etc/sing-box/templates/config_full_vpn.tpl.json
+deploy "$SCRIPT_DIR/configs/sing-box/templates/config_global_except_ru.tpl.json" /etc/sing-box/templates/config_global_except_ru.tpl.json
 cp "$SCRIPT_DIR/configs/sing-box/rules/geoip-ru.srs" /etc/sing-box/rules/
 cp "$SCRIPT_DIR/configs/sing-box/rules/geosite-category-ru.srs" /etc/sing-box/rules/
 
 # ===== 4. Create initial vless_profiles.json =====
-log "Creating VLESS profiles..."
 PROFILES_FILE="/etc/vless_profiles.json"
 PROFILE_ID="p1"
 PORT_FULL=12345
 PORT_GLOBAL=12346
 
-echo "{\"profiles\":[{\"id\":\"$PROFILE_ID\",\"name\":\"$VLESS_PROFILE_NAME\",\"server\":\"$VLESS_SERVER\",\"server_port\":$VLESS_PORT,\"uuid\":\"$VLESS_UUID\",\"security\":\"$VLESS_SECURITY\",\"public_key\":\"$REALITY_PUBLIC_KEY\",\"short_id\":\"$REALITY_SHORT_ID\",\"sni\":\"$REALITY_SNI\",\"fingerprint\":\"$TLS_FINGERPRINT\",\"flow\":\"$VLESS_FLOW\",\"port_full_vpn\":$PORT_FULL,\"port_global_except_ru\":$PORT_GLOBAL}],\"default_profile_id\":\"$PROFILE_ID\",\"next_port\":12347,\"next_id\":2}" > "$PROFILES_FILE"
+if [ -f "$PROFILES_FILE" ] && grep -q '"profiles":\[' "$PROFILES_FILE"; then
+    log "Profiles file exists, keeping existing profiles"
+else
+    log "Creating VLESS profiles..."
+    echo "{\"profiles\":[{\"id\":\"$PROFILE_ID\",\"name\":\"$VLESS_PROFILE_NAME\",\"server\":\"$VLESS_SERVER\",\"server_port\":$VLESS_PORT,\"uuid\":\"$VLESS_UUID\",\"security\":\"$VLESS_SECURITY\",\"public_key\":\"$REALITY_PUBLIC_KEY\",\"short_id\":\"$REALITY_SHORT_ID\",\"sni\":\"$REALITY_SNI\",\"fingerprint\":\"$TLS_FINGERPRINT\",\"flow\":\"$VLESS_FLOW\",\"port_full_vpn\":$PORT_FULL,\"port_global_except_ru\":$PORT_GLOBAL}],\"default_profile_id\":\"$PROFILE_ID\",\"next_port\":12347,\"next_id\":2}" > "$PROFILES_FILE"
+fi
 
 # ===== 5. Generate sing-box configs from templates =====
+if [ -f "/etc/sing-box/config_full_vpn_${PROFILE_ID}.json" ]; then
+    log "sing-box configs already exist, skipping generation"
+else
 log "Generating sing-box configs for initial profile..."
 
 # Build security block (flow + tls) or empty for security=none
@@ -230,15 +331,16 @@ for mode in full_vpn global_except_ru; do
         ' > "/etc/sing-box/config_${mode}_${PROFILE_ID}.json"
 done
 rm -f "$SEC_FILE"
+fi
 
 # ===== 6. Deploy sing-box init.d =====
 log "Deploying sing-box init.d script..."
-cp "$SCRIPT_DIR/scripts/init.d/sing-box" /etc/init.d/sing-box
+deploy "$SCRIPT_DIR/scripts/init.d/sing-box" /etc/init.d/sing-box
 chmod +x /etc/init.d/sing-box
 
 # ===== 7. Deploy update-rulesets script + cron =====
 log "Deploying rule set update script..."
-cp "$SCRIPT_DIR/scripts/update-rulesets.sh" /etc/sing-box/update-rulesets.sh
+deploy "$SCRIPT_DIR/scripts/update-rulesets.sh" /etc/sing-box/update-rulesets.sh
 chmod +x /etc/sing-box/update-rulesets.sh
 
 # Add weekly cron job (Monday 4:00 AM)
@@ -246,32 +348,36 @@ CRON_LINE="0 4 * * 1 /etc/sing-box/update-rulesets.sh"
 (crontab -l 2>/dev/null | grep -v "update-rulesets.sh"; echo "$CRON_LINE") | crontab -
 
 # ===== 8. Deploy zapret config and hostlist =====
-log "Deploying zapret config..."
-cp "$SCRIPT_DIR/configs/zapret/config" "$ZAPRET_DIR/config"
-mkdir -p "$ZAPRET_DIR/ipset"
-cp "$SCRIPT_DIR/configs/zapret/zapret-hosts-user.txt" "$ZAPRET_DIR/ipset/zapret-hosts-user.txt"
-
-# ===== 9. Zapret symlinks =====
-log "Setting up zapret symlinks..."
-if [ -f "$ZAPRET_DIR/init.d/sysv/zapret2" ]; then
-    ln -sf "$ZAPRET_DIR/init.d/sysv/zapret2" /etc/init.d/zapret2
-    chmod +x "$ZAPRET_DIR/init.d/sysv/zapret2"
-elif [ -f "$ZAPRET_DIR/init.d/sysv/zapret" ]; then
-    ln -sf "$ZAPRET_DIR/init.d/sysv/zapret" /etc/init.d/zapret2
-    chmod +x "$ZAPRET_DIR/init.d/sysv/zapret"
+if [ "$SETUP_MODE" != "vpn-only" ]; then
+    log "Deploying zapret config..."
+    deploy "$SCRIPT_DIR/configs/zapret/config" "$ZAPRET_DIR/config"
+    mkdir -p "$ZAPRET_DIR/ipset"
+    deploy "$SCRIPT_DIR/configs/zapret/zapret-hosts-user.txt" "$ZAPRET_DIR/ipset/zapret-hosts-user.txt"
 fi
 
-[ -f "$ZAPRET_DIR/init.d/openwrt/firewall.zapret2" ] && \
-    ln -sf "$ZAPRET_DIR/init.d/openwrt/firewall.zapret2" /etc/firewall.zapret2
+# ===== 9. Zapret symlinks =====
+if [ "$SETUP_MODE" != "vpn-only" ]; then
+    log "Setting up zapret symlinks..."
+    if [ -f "$ZAPRET_DIR/init.d/sysv/zapret2" ]; then
+        ln -sf "$ZAPRET_DIR/init.d/sysv/zapret2" /etc/init.d/zapret2
+        chmod +x "$ZAPRET_DIR/init.d/sysv/zapret2"
+    elif [ -f "$ZAPRET_DIR/init.d/sysv/zapret" ]; then
+        ln -sf "$ZAPRET_DIR/init.d/sysv/zapret" /etc/init.d/zapret2
+        chmod +x "$ZAPRET_DIR/init.d/sysv/zapret"
+    fi
 
-mkdir -p /etc/hotplug.d/iface
-[ -f "$ZAPRET_DIR/init.d/openwrt/90-zapret2" ] && \
-    ln -sf "$ZAPRET_DIR/init.d/openwrt/90-zapret2" /etc/hotplug.d/iface/90-zapret2
+    [ -f "$ZAPRET_DIR/init.d/openwrt/firewall.zapret2" ] && \
+        ln -sf "$ZAPRET_DIR/init.d/openwrt/firewall.zapret2" /etc/firewall.zapret2
+
+    mkdir -p /etc/hotplug.d/iface
+    [ -f "$ZAPRET_DIR/init.d/openwrt/90-zapret2" ] && \
+        ln -sf "$ZAPRET_DIR/init.d/openwrt/90-zapret2" /etc/hotplug.d/iface/90-zapret2
+fi
 
 # ===== 10. Deploy CGI panel =====
 log "Deploying web control panel..."
 mkdir -p /www/cgi-bin
-cp "$SCRIPT_DIR/scripts/cgi-bin/vpn" /www/cgi-bin/vpn
+deploy "$SCRIPT_DIR/scripts/cgi-bin/vpn" /www/cgi-bin/vpn
 chmod +x /www/cgi-bin/vpn
 
 # Init state files
@@ -280,28 +386,43 @@ chmod +x /www/cgi-bin/vpn
 
 # ===== 11. Setup nftables + ip rule =====
 log "Setting up nftables and ip rule..."
-cp "$SCRIPT_DIR/configs/nftables/proxy-tproxy.sh" /etc/proxy-tproxy.sh
+deploy "$SCRIPT_DIR/configs/nftables/proxy-tproxy.sh" /etc/proxy-tproxy.sh
 chmod +x /etc/proxy-tproxy.sh
 sh /etc/proxy-tproxy.sh
 
 # ===== 12. Configure Wi-Fi =====
 log "Configuring Wi-Fi..."
-uci set wireless.radio0.disabled='0'
-uci set wireless.default_radio0.ssid="$WIFI_SSID"
-uci set wireless.default_radio0.encryption='psk2'
-uci set wireless.default_radio0.key="$WIFI_PASSWORD"
 
-uci set wireless.radio1.disabled='0'
-uci set wireless.default_radio1.ssid="$WIFI_SSID_5G"
-uci set wireless.default_radio1.encryption='sae-mixed'
-uci set wireless.default_radio1.key="$WIFI_PASSWORD"
+# Detect radio bands dynamically (supports 2/3+ radio devices like GL-MT6000)
+RADIO_24="" ; RADIO_5=""
+for radio in $(uci show wireless 2>/dev/null | grep '=wifi-device' | cut -d. -f2 | cut -d= -f1); do
+    band=$(uci get "wireless.$radio.band" 2>/dev/null)
+    case "$band" in
+        2g) RADIO_24="$radio" ;;
+        5g) [ -z "$RADIO_5" ] && RADIO_5="$radio" ;;
+    esac
+done
+# Fallback to legacy numbering
+[ -z "$RADIO_24" ] && RADIO_24="radio0"
+[ -z "$RADIO_5" ] && RADIO_5="radio1"
+
+uci set "wireless.$RADIO_24.disabled=0"
+uci set "wireless.default_$RADIO_24.ssid=$WIFI_SSID"
+uci set "wireless.default_$RADIO_24.encryption=psk2"
+uci set "wireless.default_$RADIO_24.key=$WIFI_PASSWORD"
+
+uci set "wireless.$RADIO_5.disabled=0"
+uci set "wireless.default_$RADIO_5.ssid=$WIFI_SSID_5G"
+uci set "wireless.default_$RADIO_5.encryption=sae-mixed"
+uci set "wireless.default_$RADIO_5.key=$WIFI_PASSWORD"
 
 uci commit wireless
 
 # ===== 13. Configure uhttpd for CGI =====
 log "Configuring uhttpd..."
-uci set uhttpd.main.interpreter='.cgi=/bin/sh'
-uci add_list uhttpd.main.cgi_prefix='/cgi-bin' 2>/dev/null || true
+# Remove duplicate cgi_prefix entries, then add once
+uci delete uhttpd.main.cgi_prefix 2>/dev/null || true
+uci add_list uhttpd.main.cgi_prefix='/cgi-bin'
 uci commit uhttpd
 
 # ===== 14. Create boot script for nftables/ip rule =====
@@ -316,6 +437,7 @@ USE_PROCD=1
 
 STATE_FILE="/etc/vpn_state.json"
 PROFILES_FILE="/etc/vless_profiles.json"
+LAN_IFACE=$(cat /etc/vpn_lan_iface 2>/dev/null || echo "br-lan")
 
 get_all_servers() {
     grep -o '"server":"[^"]*"' "$PROFILES_FILE" | sed 's/"server":"//;s/"//' | sort -u | tr '\n' ',' | sed 's/,$//'
@@ -352,7 +474,7 @@ start_service() {
     ip route replace local 0.0.0.0/0 dev lo table 100
 
     # DHCP must bypass tproxy (broadcast 255.255.255.255 not in excluded ranges)
-    nft insert rule ip proxy_tproxy prerouting iifname "br-lan" udp dport '{ 67, 68 }' accept 2>/dev/null
+    nft insert rule ip proxy_tproxy prerouting iifname "$LAN_IFACE" udp dport '{ 67, 68 }' accept 2>/dev/null
 
     # Restore state from JSON
     restore_state
@@ -399,16 +521,16 @@ restore_state() {
 
         if [ "$vpn_val" = "true" ]; then
             nft add rule ip proxy_tproxy prerouting \
-                iifname "br-lan" ether saddr "$mac" \
+                iifname "$LAN_IFACE" ether saddr "$mac" \
                 ip daddr != "{ $VPN_EXCLUDE }" \
                 meta l4proto tcp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
             nft add rule ip proxy_tproxy prerouting \
-                iifname "br-lan" ether saddr "$mac" \
+                iifname "$LAN_IFACE" ether saddr "$mac" \
                 ip daddr != "{ $VPN_EXCLUDE }" \
                 meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
         elif [ "$vpn_val" = "false" ]; then
             nft add rule ip proxy_tproxy prerouting \
-                iifname "br-lan" ether saddr "$mac" accept 2>/dev/null
+                iifname "$LAN_IFACE" ether saddr "$mac" accept 2>/dev/null
         fi
 
         if [ "$zapret_val" = "true" ]; then
@@ -427,7 +549,7 @@ add_catchall() {
     DEFAULT_PID=$(get_default_profile_id)
 
     # Auto-fix: if no device uses the current default, pick the most used profile
-    if [ -f "$STATE_FILE" ] && ! grep -q "\"profile_id\":\"$DEFAULT_PID\"" "$STATE_FILE"; then
+    if [ -f "$STATE_FILE" ] && ! grep -q "\"profile_id\":\"$DEFAULT_PID\"[,\"}]" "$STATE_FILE"; then
         MOST_USED=$(grep -o '"profile_id":"[^"]*"' "$STATE_FILE" | sort | uniq -c | sort -rn | head -1 | grep -o '"[^"]*"$' | tr -d '"')
         if [ -n "$MOST_USED" ] && [ "$MOST_USED" != "$DEFAULT_PID" ]; then
             sed -i "s/\"default_profile_id\":\"[^\"]*\"/\"default_profile_id\":\"$MOST_USED\"/" "$PROFILES_FILE"
@@ -440,17 +562,17 @@ add_catchall() {
     [ -z "$DEFAULT_VPN_PORT" ] && DEFAULT_VPN_PORT=12346
 
     nft add rule ip proxy_tproxy prerouting \
-        iifname "br-lan" \
+        iifname "$LAN_IFACE" \
         ip daddr != "{ $VPN_EXCLUDE }" \
         meta l4proto tcp tproxy to :$DEFAULT_VPN_PORT meta mark set 0x1 accept 2>/dev/null
     nft add rule ip proxy_tproxy prerouting \
-        iifname "br-lan" \
+        iifname "$LAN_IFACE" \
         ip daddr != "{ $VPN_EXCLUDE }" \
         meta l4proto udp tproxy to :$DEFAULT_VPN_PORT meta mark set 0x1 accept 2>/dev/null
     logger -t proxy-routing "Catch-all VPN (port $DEFAULT_VPN_PORT, global_except_ru) enabled"
 
     # Catch-all: zapret OFF for unknown devices
-    nft add rule inet proxy_route forward_zapret iifname "br-lan" return 2>/dev/null
+    nft add rule inet proxy_route forward_zapret iifname "$LAN_IFACE" return 2>/dev/null
     logger -t proxy-routing "Catch-all zapret OFF (return) enabled"
 }
 INITEOF
@@ -460,21 +582,29 @@ chmod +x /etc/init.d/proxy-routing
 log "Enabling and starting services..."
 
 /etc/init.d/proxy-routing enable
+/etc/init.d/proxy-routing start || warn "proxy-routing failed to start"
 
 /etc/init.d/sing-box enable
 /etc/init.d/sing-box start || warn "sing-box failed to start, check configs"
 
-if [ -x /etc/init.d/zapret2 ]; then
-    /etc/init.d/zapret2 enable
-    /etc/init.d/zapret2 start || warn "zapret2 failed to start"
-else
-    warn "zapret2 init script not found, skipping"
+# Zapret uses sysv init — enable via rc.d symlink, start directly
+if [ "$SETUP_MODE" != "vpn-only" ]; then
+    if [ -x /etc/init.d/zapret2 ]; then
+        ln -sf /etc/init.d/zapret2 /etc/rc.d/S99zapret2 2>/dev/null
+        ZAPRET_INIT=$(readlink -f /etc/init.d/zapret2 2>/dev/null || ls -l /etc/init.d/zapret2 | awk '{print $NF}')
+        "$ZAPRET_INIT" start || warn "zapret failed to start"
+    else
+        warn "zapret init script not found, skipping"
+    fi
 fi
 
 /etc/init.d/uhttpd restart
 
 wifi reload
 
-log "Setup complete!"
-log "Web panel: http://192.168.2.1/cgi-bin/vpn"
+# Save setup mode for CGI panel awareness
+echo "$SETUP_MODE" > /etc/vpn_setup_mode
+
+log "Setup complete! (mode: $SETUP_MODE)"
+log "Web panel: http://${ROUTER_IP}/cgi-bin/vpn"
 log "Connect to Wi-Fi: $WIFI_SSID / $WIFI_SSID_5G"
