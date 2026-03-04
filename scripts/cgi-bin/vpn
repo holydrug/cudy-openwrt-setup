@@ -16,36 +16,20 @@ CUSTOM_RULES_FILE="/etc/sing-box/custom_rules.json"
 [ -f "$PROFILES_FILE" ] || echo '{"profiles":[],"default_profile_id":"","next_port":12345,"next_id":1}' > "$PROFILES_FILE"
 [ -f "$CUSTOM_RULES_FILE" ] || echo '{"direct":[],"vpn":[]}' > "$CUSTOM_RULES_FILE"
 
-# ===== Profile helpers =====
+# ===== Source shared library =====
+LIB_DIR="/etc/sing-box/lib"
+if [ ! -f "$LIB_DIR/generate.sh" ]; then
+    echo "Content-Type: text/html; charset=utf-8"
+    echo ""
+    echo "<html><body><h1>Error: Library not found</h1>"
+    echo "<p>Missing: $LIB_DIR/generate.sh</p>"
+    echo "<p>Run <code>setup.sh</code> or <code>upgrade.sh</code> to deploy it.</p>"
+    echo "</body></html>"
+    exit 1
+fi
+. "$LIB_DIR/generate.sh"
 
-get_all_servers() {
-    grep -o '"server":"[^"]*"' "$PROFILES_FILE" | sed 's/"server":"//;s/"//' | sort -u | tr '\n' ',' | sed 's/,$//'
-}
-
-get_default_profile_id() {
-    grep -o '"default_profile_id":"[^"]*"' "$PROFILES_FILE" | head -1 | sed 's/.*"default_profile_id":"//;s/"//'
-}
-
-get_profile_port() {
-    local pid="$1" mode="$2"
-    local key
-    case "$mode" in
-        full_vpn) key="port_full_vpn" ;;
-        *) key="port_global_except_ru" ;;
-    esac
-    grep -o "\"id\":\"$pid\"[^}]*" "$PROFILES_FILE" | grep -o "\"$key\":[0-9]*" | head -1 | sed "s/\"$key\"://"
-}
-
-get_profile_field() {
-    local pid="$1" field="$2"
-    grep -o "\"id\":\"$pid\"[^}]*" "$PROFILES_FILE" | grep -o "\"$field\":\"[^\"]*\"" | head -1 | sed "s/\"$field\":\"//;s/\"//"
-}
-
-get_profile_ids() {
-    grep -o '"id":"[^"]*"' "$PROFILES_FILE" | sed 's/"id":"//;s/"//'
-}
-
-# ===== Custom rules helpers =====
+# ===== Custom rules helpers (CGI-specific) =====
 
 add_custom_rule() {
     local domain="$1" direction="$2"
@@ -58,54 +42,6 @@ add_custom_rule() {
 delete_custom_rule() {
     local domain="$1" direction="$2"
     sed -i "s|,\"$domain\"||g; s|\"$domain\",||g; s|\"$domain\"||g" "$CUSTOM_RULES_FILE"
-}
-
-build_custom_rules_file() {
-    local mode="$1" route_out="$2" dns_out="$3"
-    local rules_file="$CUSTOM_RULES_FILE"
-    > "$route_out"; > "$dns_out"
-    [ -f "$rules_file" ] || return 0
-
-    local direct=$(grep -o '"direct":\[[^]]*\]' "$rules_file" | sed 's/"direct":\[//;s/\]$//' | tr -d ' ')
-    local vpn=$(grep -o '"vpn":\[[^]]*\]' "$rules_file" | sed 's/"vpn":\[//;s/\]$//' | tr -d ' ')
-
-    case "$mode" in
-        global_except_ru)
-            [ -n "$direct" ] && {
-                echo "      {\"domain_suffix\":[$direct],\"outbound\":\"direct\"}," >> "$route_out"
-                echo "      {\"domain_suffix\":[$direct],\"server\":\"dns-direct\"}," >> "$dns_out"
-            }
-            [ -n "$vpn" ] && {
-                echo "      {\"domain_suffix\":[$vpn],\"outbound\":\"vless-out\"}," >> "$route_out"
-                echo "      {\"domain_suffix\":[$vpn],\"server\":\"dns-remote\"}," >> "$dns_out"
-            }
-            ;;
-        full_vpn)
-            [ -n "$direct" ] && {
-                echo "      ,{\"domain_suffix\":[$direct],\"outbound\":\"direct\"}" >> "$route_out"
-                echo "      ,{\"domain_suffix\":[$direct],\"server\":\"dns-direct\"}" >> "$dns_out"
-            }
-            ;;
-    esac
-}
-
-regenerate_all_configs() {
-    get_profile_ids | while read pid; do
-        local server=$(get_profile_field "$pid" "server")
-        local server_port=$(grep -o "\"id\":\"$pid\"[^}]*" "$PROFILES_FILE" | grep -o '"server_port":[0-9]*' | head -1 | sed 's/"server_port"://')
-        local uuid=$(get_profile_field "$pid" "uuid")
-        local pbk=$(get_profile_field "$pid" "public_key")
-        local sid=$(get_profile_field "$pid" "short_id")
-        local sni=$(get_profile_field "$pid" "sni")
-        local fp=$(get_profile_field "$pid" "fingerprint")
-        local flow=$(get_profile_field "$pid" "flow")
-        local security=$(get_profile_field "$pid" "security")
-        local port_full=$(get_profile_port "$pid" "full_vpn")
-        local port_global=$(get_profile_port "$pid" "global_except_ru")
-        generate_configs "$pid" "$port_full" "$port_global" \
-            "$server" "$server_port" "$uuid" "$pbk" "$sid" "$sni" "$fp" "$flow" "$security"
-    done
-    /etc/init.d/sing-box restart 2>/dev/null
 }
 
 # Build VPN_SERVERS exclusion string from all profiles
@@ -226,83 +162,6 @@ parse_vless_uri() {
     [ "$P_SECURITY" = "reality" ] && { [ -z "$P_PBK" ] && return 1; [ -z "$P_SID" ] && return 1; }
     [ "$P_PORT" -ge 1 ] 2>/dev/null && [ "$P_PORT" -le 65535 ] 2>/dev/null || return 1
     return 0
-}
-
-# ===== Generate sing-box configs from template =====
-
-generate_configs() {
-    local pid="$1" port_full="$2" port_global="$3"
-    local server="$4" server_port="$5" uuid="$6"
-    local pbk="$7" sid="$8" sni="$9"
-    shift 9
-    local fp="$1" flow="$2" security="$3"
-
-    # Build security block (flow + tls) or empty for security=none
-    local sec_file="/tmp/sb_sec_block_$$"
-    if [ "$security" = "none" ]; then
-        printf '' > "$sec_file"
-    else
-        cat > "$sec_file" << SECEOF
-,
-      "flow": "$flow",
-      "tls": {
-        "enabled": true,
-        "server_name": "$sni",
-        "utls": {
-          "enabled": true,
-          "fingerprint": "$fp"
-        },
-        "reality": {
-          "enabled": true,
-          "public_key": "$pbk",
-          "short_id": "$sid"
-        }
-      }
-SECEOF
-    fi
-
-    for mode in full_vpn global_except_ru; do
-        local tpl="$TEMPLATES_DIR/config_${mode}.tpl.json"
-        [ -f "$tpl" ] || continue
-        local listen_port
-        case "$mode" in
-            full_vpn) listen_port="$port_full" ;;
-            *) listen_port="$port_global" ;;
-        esac
-
-        local cr_route="/tmp/sb_custom_route_$$"
-        local cr_dns="/tmp/sb_custom_dns_$$"
-        build_custom_rules_file "$mode" "$cr_route" "$cr_dns"
-
-        sed \
-            -e "s|%%LISTEN_PORT%%|$listen_port|g" \
-            -e "s|%%PROFILE_ID%%|$pid|g" \
-            -e "s|%%VLESS_SERVER%%|$server|g" \
-            -e "s|%%VLESS_PORT%%|$server_port|g" \
-            -e "s|%%VLESS_UUID%%|$uuid|g" \
-            "$tpl" | awk -v secfile="$sec_file" -v crroute="$cr_route" -v crdns="$cr_dns" '
-            /%%VLESS_SECURITY_BLOCK%%/ {
-                gsub(/%%VLESS_SECURITY_BLOCK%%/, "")
-                printf "%s", $0
-                while ((getline line < secfile) > 0) print line
-                close(secfile)
-                next
-            }
-            /%%CUSTOM_ROUTE_RULES%%/ {
-                while ((getline line < crroute) > 0) print line
-                close(crroute)
-                next
-            }
-            /%%CUSTOM_DNS_RULES%%/ {
-                while ((getline line < crdns) > 0) print line
-                close(crdns)
-                next
-            }
-            { print }
-            ' > "/etc/sing-box/config_${mode}_${pid}.json"
-        rm -f "$cr_route" "$cr_dns"
-    done
-    rm -f "$sec_file"
 }
 
 # ===== JSON helpers =====
@@ -638,6 +497,22 @@ case "$action" in
         ;;
     killswitch_off)
         remove_killswitch
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/vpn"
+        echo ""
+        exit 0
+        ;;
+    adblock_on)
+        echo "1" > /etc/vpn_adblock
+        regenerate_all_configs
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/vpn"
+        echo ""
+        exit 0
+        ;;
+    adblock_off)
+        echo "0" > /etc/vpn_adblock
+        regenerate_all_configs
         echo "Status: 302 Found"
         echo "Location: /cgi-bin/vpn"
         echo ""
@@ -999,6 +874,27 @@ cat <<EOF
   </div>
 </div>
 EOF
+
+# ===== Adblock section =====
+if [ -f /etc/sing-box/rules/geosite-category-ads-all.srs ]; then
+    adblock_state=$(cat /etc/vpn_adblock 2>/dev/null || echo "0")
+    if [ "$adblock_state" = "1" ]; then
+        ab_class="btn-on"; ab_text="ON"; ab_action="adblock_off"
+    else
+        ab_class="btn-off"; ab_text="OFF"; ab_action="adblock_on"
+    fi
+    cat <<EOF
+<div class="section">
+  <div style="display:flex;align-items:center;justify-content:space-between">
+    <div>
+      <h2>Adblock (sing-box)</h2>
+      <div style="color:#888;font-size:.8em">Block ads in VPN traffic via rule-set</div>
+    </div>
+    <a class="btn ${ab_class}" href="?action=${ab_action}">${ab_text}</a>
+  </div>
+</div>
+EOF
+fi
 
 # ===== Custom Routes section =====
 cat <<'CUSTOMHEAD'

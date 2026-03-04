@@ -14,13 +14,14 @@
         "tag": "dns-direct",
         "address": "local",
         "detour": "direct"
-      }
+      }%%ADBLOCK_DNS_SERVER%%
     ],
     "rules": [
       {
         "outbound": "direct",
         "server": "dns-direct"
       },
+%%ADBLOCK_DNS_RULE%%
 %%CUSTOM_DNS_RULES%%
       {
         "rule_set": "geosite-category-ru",
@@ -49,7 +50,7 @@
     {
       "type": "direct",
       "tag": "direct"
-    }
+    }%%ADBLOCK_BLOCK_OUTBOUND%%
   ],
   "experimental": {
     "cache_file": {
@@ -63,6 +64,7 @@
         "ip_cidr": ["%%VLESS_SERVER%%/32"],
         "outbound": "direct"
       },
+%%ADBLOCK_ROUTE_RULE%%
 %%CUSTOM_ROUTE_RULES%%
       {
         "rule_set": ["geoip-ru", "geosite-category-ru"],
@@ -81,7 +83,7 @@
         "tag": "geosite-category-ru",
         "format": "binary",
         "path": "/etc/sing-box/rules/geosite-category-ru.srs"
-      }
+      }%%ADBLOCK_RULE_SET_ENTRY%%
     ],
     "auto_detect_interface": true
   }

@@ -6,6 +6,7 @@
 RULES_DIR="/etc/sing-box/rules"
 GEOIP_URL="https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs"
 GEOSITE_URL="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs"
+GEOSITE_ADS_URL="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs"
 MIN_SIZE=500
 
 log() { logger -t update-rulesets "$1"; }
@@ -38,6 +39,7 @@ mkdir -p "$RULES_DIR"
 updated=0
 download_rule "$GEOIP_URL" "$RULES_DIR/geoip-ru.srs" "geoip-ru" && updated=1
 download_rule "$GEOSITE_URL" "$RULES_DIR/geosite-category-ru.srs" "geosite-category-ru" && updated=1
+download_rule "$GEOSITE_ADS_URL" "$RULES_DIR/geosite-category-ads-all.srs" "geosite-category-ads-all" && updated=1
 
 if [ "$updated" -eq 1 ]; then
     log "Rule sets updated, restarting sing-box..."

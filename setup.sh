@@ -26,6 +26,21 @@ ask() { printf "${CYAN}[?]${NC} %s" "$1"; }
 # Copy file and strip Windows line endings (CRLF → LF)
 deploy() { cp "$1" "$2" && sed -i 's/\r$//' "$2"; }
 
+# ===== Re-run detection =====
+if [ -f /etc/vless_profiles.json ] && [ -f /etc/init.d/proxy-routing ]; then
+    echo ""
+    echo "=== Existing installation detected ==="
+    echo "  1) Upgrade   — update scripts/templates, keep settings"
+    echo "  2) Reinstall — fresh setup, preserves profiles & state"
+    echo "  3) Abort"
+    ask "Select action [3]: "; read EXISTING_CHOICE
+    case "$EXISTING_CHOICE" in
+        1) exec sh "$SCRIPT_DIR/upgrade.sh" "$@" ;;
+        2) log "Reinstalling..." ;;
+        *) exit 0 ;;
+    esac
+fi
+
 # ===== Disk space check =====
 check_space() {
     local required_mb="$1"
@@ -281,108 +296,29 @@ fi
 CUSTOM_RULES_FILE="/etc/sing-box/custom_rules.json"
 [ -f "$CUSTOM_RULES_FILE" ] || echo '{"direct":[],"vpn":[]}' > "$CUSTOM_RULES_FILE"
 
-# ===== Custom rules builder =====
-build_custom_rules_file() {
-    local mode="$1" route_out="$2" dns_out="$3"
-    local rules_file="$CUSTOM_RULES_FILE"
-    > "$route_out"; > "$dns_out"
-    [ -f "$rules_file" ] || return 0
-
-    local direct=$(grep -o '"direct":\[[^]]*\]' "$rules_file" | sed 's/"direct":\[//;s/\]$//' | tr -d ' ')
-    local vpn=$(grep -o '"vpn":\[[^]]*\]' "$rules_file" | sed 's/"vpn":\[//;s/\]$//' | tr -d ' ')
-
-    case "$mode" in
-        global_except_ru)
-            [ -n "$direct" ] && {
-                echo "      {\"domain_suffix\":[$direct],\"outbound\":\"direct\"}," >> "$route_out"
-                echo "      {\"domain_suffix\":[$direct],\"server\":\"dns-direct\"}," >> "$dns_out"
-            }
-            [ -n "$vpn" ] && {
-                echo "      {\"domain_suffix\":[$vpn],\"outbound\":\"vless-out\"}," >> "$route_out"
-                echo "      {\"domain_suffix\":[$vpn],\"server\":\"dns-remote\"}," >> "$dns_out"
-            }
-            ;;
-        full_vpn)
-            [ -n "$direct" ] && {
-                echo "      ,{\"domain_suffix\":[$direct],\"outbound\":\"direct\"}" >> "$route_out"
-                echo "      ,{\"domain_suffix\":[$direct],\"server\":\"dns-direct\"}" >> "$dns_out"
-            }
-            ;;
-    esac
-}
-
-# ===== 6. Generate sing-box configs from templates =====
+# ===== 6. Source shared library & generate sing-box configs =====
 log "Generating sing-box configs..."
 
-# Build security block (flow + tls) or empty for security=none
-SEC_FILE="/tmp/sb_sec_block_$$"
-if [ "$VLESS_SECURITY" = "none" ]; then
-    printf '' > "$SEC_FILE"
-else
-    cat > "$SEC_FILE" << SECEOF
-,
-      "flow": "$VLESS_FLOW",
-      "tls": {
-        "enabled": true,
-        "server_name": "$REALITY_SNI",
-        "utls": {
-          "enabled": true,
-          "fingerprint": "$TLS_FINGERPRINT"
-        },
-        "reality": {
-          "enabled": true,
-          "public_key": "$REALITY_PUBLIC_KEY",
-          "short_id": "$REALITY_SHORT_ID"
-        }
-      }
-SECEOF
-fi
+TEMPLATES_DIR="/etc/sing-box/templates"
+. "$SCRIPT_DIR/scripts/lib/generate.sh"
 
-for mode in full_vpn global_except_ru; do
-    tpl="/etc/sing-box/templates/config_${mode}.tpl.json"
-    case "$mode" in
-        full_vpn) listen_port="$PORT_FULL" ;;
-        *) listen_port="$PORT_GLOBAL" ;;
-    esac
+# Initialize adblock OFF for fresh install
+[ -f /etc/vpn_adblock ] || echo "0" > /etc/vpn_adblock
 
-    cr_route="/tmp/sb_custom_route_$$"
-    cr_dns="/tmp/sb_custom_dns_$$"
-    build_custom_rules_file "$mode" "$cr_route" "$cr_dns"
-
-    sed \
-        -e "s|%%LISTEN_PORT%%|$listen_port|g" \
-        -e "s|%%PROFILE_ID%%|$PROFILE_ID|g" \
-        -e "s|%%VLESS_SERVER%%|$VLESS_SERVER|g" \
-        -e "s|%%VLESS_PORT%%|$VLESS_PORT|g" \
-        -e "s|%%VLESS_UUID%%|$VLESS_UUID|g" \
-        "$tpl" | awk -v secfile="$SEC_FILE" -v crroute="$cr_route" -v crdns="$cr_dns" '
-        /%%VLESS_SECURITY_BLOCK%%/ {
-            gsub(/%%VLESS_SECURITY_BLOCK%%/, "")
-            printf "%s", $0
-            while ((getline line < secfile) > 0) print line
-            close(secfile)
-            next
-        }
-        /%%CUSTOM_ROUTE_RULES%%/ {
-            while ((getline line < crroute) > 0) print line
-            close(crroute)
-            next
-        }
-        /%%CUSTOM_DNS_RULES%%/ {
-            while ((getline line < crdns) > 0) print line
-            close(crdns)
-            next
-        }
-        { print }
-        ' > "/etc/sing-box/config_${mode}_${PROFILE_ID}.json"
-    rm -f "$cr_route" "$cr_dns"
-done
-rm -f "$SEC_FILE"
+generate_configs "$PROFILE_ID" "$PORT_FULL" "$PORT_GLOBAL" \
+    "$VLESS_SERVER" "$VLESS_PORT" "$VLESS_UUID" \
+    "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" "$REALITY_SNI" \
+    "$TLS_FINGERPRINT" "$VLESS_FLOW" "$VLESS_SECURITY"
 
 # ===== 7. Deploy sing-box init.d =====
 log "Deploying sing-box init.d script..."
 deploy "$SCRIPT_DIR/scripts/init.d/sing-box" /etc/init.d/sing-box
 chmod +x /etc/init.d/sing-box
+
+# ===== 7b. Deploy shared library =====
+log "Deploying shared library..."
+mkdir -p /etc/sing-box/lib
+deploy "$SCRIPT_DIR/scripts/lib/generate.sh" /etc/sing-box/lib/generate.sh
 
 # ===== 8. Deploy update-rulesets script + cron =====
 log "Deploying rule set update script..."
@@ -471,166 +407,9 @@ uci delete uhttpd.main.cgi_prefix 2>/dev/null || true
 uci add_list uhttpd.main.cgi_prefix='/cgi-bin'
 uci commit uhttpd
 
-# ===== 15. Create boot script for nftables/ip rule =====
-log "Creating boot autostart script..."
-cat > /etc/init.d/proxy-routing <<'INITEOF'
-#!/bin/sh /etc/rc.common
-
-START=99
-STOP=10
-
-USE_PROCD=1
-
-STATE_FILE="/etc/vpn_state.json"
-PROFILES_FILE="/etc/vless_profiles.json"
-LAN_IFACE=$(cat /etc/vpn_lan_iface 2>/dev/null || echo "br-lan")
-
-get_all_servers() {
-    grep -o '"server":"[^"]*"' "$PROFILES_FILE" | sed 's/"server":"//;s/"//' | sort -u | tr '\n' ',' | sed 's/,$//'
-}
-
-get_default_profile_id() {
-    grep -o '"default_profile_id":"[^"]*"' "$PROFILES_FILE" | head -1 | sed 's/.*"default_profile_id":"//;s/"//'
-}
-
-get_profile_port() {
-    local pid="$1" mode="$2" key
-    case "$mode" in
-        full_vpn) key="port_full_vpn" ;;
-        *) key="port_global_except_ru" ;;
-    esac
-    grep -o "\"id\":\"$pid\"[^}]*" "$PROFILES_FILE" | grep -o "\"$key\":[0-9]*" | head -1 | sed "s/\"$key\"://"
-}
-
-start_service() {
-    ALL_SERVERS=$(get_all_servers)
-    [ -z "$ALL_SERVERS" ] && { logger -t proxy-routing "No VPN servers found, aborting"; return 1; }
-
-    VPN_EXCLUDE="10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, $ALL_SERVERS"
-
-    # Create nftables tables and chains
-    nft add table ip proxy_tproxy 2>/dev/null
-    nft add chain ip proxy_tproxy prerouting '{ type filter hook prerouting priority mangle; policy accept; }' 2>/dev/null
-    nft add table inet proxy_route 2>/dev/null
-    nft add chain inet proxy_route forward_zapret '{ type filter hook forward priority filter; policy accept; }' 2>/dev/null
-
-    # Set up routing for tproxy
-    ip rule del fwmark 1 lookup 100 2>/dev/null
-    ip rule add fwmark 1 lookup 100
-    ip route replace local 0.0.0.0/0 dev lo table 100
-
-    # DHCP must bypass tproxy (broadcast 255.255.255.255 not in excluded ranges)
-    nft insert rule ip proxy_tproxy prerouting iifname "$LAN_IFACE" udp dport '{ 67, 68 }' accept 2>/dev/null
-
-    # Restore state from JSON
-    restore_state
-
-    logger -t proxy-routing "proxy-routing started, state restored"
-}
-
-stop_service() {
-    nft flush chain ip proxy_tproxy prerouting 2>/dev/null
-    nft flush chain inet proxy_route forward_zapret 2>/dev/null
-    ip rule del fwmark 1 lookup 100 2>/dev/null
-    ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
-    logger -t proxy-routing "proxy-routing stopped"
-}
-
-restore_state() {
-    ALL_SERVERS=$(get_all_servers)
-    VPN_EXCLUDE="10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16"
-    [ -n "$ALL_SERVERS" ] && VPN_EXCLUDE="$VPN_EXCLUDE, $ALL_SERVERS"
-
-    DEFAULT_PID=$(get_default_profile_id)
-
-    [ -f "$STATE_FILE" ] || {
-        add_catchall
-        return 0
-    }
-
-    grep -oE '"[0-9a-f:]{17}":\{[^}]*\}' "$STATE_FILE" | while IFS= read -r entry; do
-        mac=$(echo "$entry" | grep -oE '[0-9a-f:]{17}')
-        vpn_val=$(echo "$entry" | grep -o '"vpn":[a-z]*' | cut -d: -f2)
-        zapret_val=$(echo "$entry" | grep -o '"zapret":[a-z]*' | cut -d: -f2)
-        routing=$(echo "$entry" | grep -o '"routing":"[^"]*"' | cut -d'"' -f4)
-        profile_id=$(echo "$entry" | grep -o '"profile_id":"[^"]*"' | cut -d'"' -f4)
-
-        [ -z "$profile_id" ] && profile_id="$DEFAULT_PID"
-
-        port=$(get_profile_port "$profile_id" "$routing")
-        [ -z "$port" ] && {
-            case "$routing" in
-                global_except_ru) port=12346 ;;
-                *) port=12345 ;;
-            esac
-        }
-
-        if [ "$vpn_val" = "true" ]; then
-            nft add rule ip proxy_tproxy prerouting \
-                iifname "$LAN_IFACE" ether saddr "$mac" \
-                ip daddr != "{ $VPN_EXCLUDE }" \
-                meta l4proto tcp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
-            nft add rule ip proxy_tproxy prerouting \
-                iifname "$LAN_IFACE" ether saddr "$mac" \
-                ip daddr != "{ $VPN_EXCLUDE }" \
-                meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
-        elif [ "$vpn_val" = "false" ]; then
-            nft add rule ip proxy_tproxy prerouting \
-                iifname "$LAN_IFACE" ether saddr "$mac" accept 2>/dev/null
-        fi
-
-        if [ "$zapret_val" = "true" ]; then
-            nft insert rule inet proxy_route forward_zapret ether saddr "$mac" accept 2>/dev/null
-        fi
-    done
-
-    add_catchall
-}
-
-add_catchall() {
-    ALL_SERVERS=$(get_all_servers)
-    VPN_EXCLUDE="10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16"
-    [ -n "$ALL_SERVERS" ] && VPN_EXCLUDE="$VPN_EXCLUDE, $ALL_SERVERS"
-
-    DEFAULT_PID=$(get_default_profile_id)
-
-    # Auto-fix: if no device uses the current default, pick the most used profile
-    if [ -f "$STATE_FILE" ] && ! grep -q "\"profile_id\":\"$DEFAULT_PID\"[,\"}]" "$STATE_FILE"; then
-        MOST_USED=$(grep -o '"profile_id":"[^"]*"' "$STATE_FILE" | sort | uniq -c | sort -rn | head -1 | grep -o '"[^"]*"$' | tr -d '"')
-        if [ -n "$MOST_USED" ] && [ "$MOST_USED" != "$DEFAULT_PID" ]; then
-            sed -i "s/\"default_profile_id\":\"[^\"]*\"/\"default_profile_id\":\"$MOST_USED\"/" "$PROFILES_FILE"
-            DEFAULT_PID="$MOST_USED"
-            logger -t proxy-routing "Auto-switched default profile to $DEFAULT_PID"
-        fi
-    fi
-
-    DEFAULT_VPN_PORT=$(get_profile_port "$DEFAULT_PID" "global_except_ru")
-    [ -z "$DEFAULT_VPN_PORT" ] && DEFAULT_VPN_PORT=12346
-
-    nft add rule ip proxy_tproxy prerouting \
-        iifname "$LAN_IFACE" \
-        ip daddr != "{ $VPN_EXCLUDE }" \
-        meta l4proto tcp tproxy to :$DEFAULT_VPN_PORT meta mark set 0x1 accept 2>/dev/null
-    nft add rule ip proxy_tproxy prerouting \
-        iifname "$LAN_IFACE" \
-        ip daddr != "{ $VPN_EXCLUDE }" \
-        meta l4proto udp tproxy to :$DEFAULT_VPN_PORT meta mark set 0x1 accept 2>/dev/null
-    logger -t proxy-routing "Catch-all VPN (port $DEFAULT_VPN_PORT, global_except_ru) enabled"
-
-    # Catch-all: zapret OFF for unknown devices
-    nft add rule inet proxy_route forward_zapret iifname "$LAN_IFACE" return 2>/dev/null
-    logger -t proxy-routing "Catch-all zapret OFF (return) enabled"
-
-    # Restore kill switch at the very end of the chain
-    if [ "$(cat /etc/vpn_killswitch 2>/dev/null)" = "1" ]; then
-        nft add rule ip proxy_tproxy prerouting \
-            iifname "$LAN_IFACE" \
-            ip daddr != "{ 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16 }" \
-            drop comment '"killswitch"' 2>/dev/null
-        logger -t proxy-routing "Kill switch restored"
-    fi
-}
-INITEOF
+# ===== 15. Deploy boot script for nftables/ip rule =====
+log "Deploying proxy-routing init.d script..."
+deploy "$SCRIPT_DIR/scripts/init.d/proxy-routing" /etc/init.d/proxy-routing
 chmod +x /etc/init.d/proxy-routing
 
 # ===== 16. Enable and start services =====

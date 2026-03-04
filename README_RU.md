@@ -12,6 +12,9 @@
   - `full_vpn` — весь трафик через VPN
   - `global_except_ru` — всё кроме RU через VPN
   - Каждый профиль получает отдельную пару sing-box инстансов на уникальных портах
+- **Adblock** — двухуровневая блокировка рекламы:
+  - **sing-box rule-set** — блокирует рекламу в VPN-трафике (geosite-category-ads-all)
+  - **AdGuard Home** — DNS-блокировка рекламы для всех устройств, веб-панель на порту 3000
 - **zapret (nfqws2)** — обход DPI для YouTube, Discord и т.д. без VPN
 - **Веб-панель** (`http://<IP_РОУТЕРА>/cgi-bin/vpn`) — управление VPN и zapret per-device по MAC
 - **nftables tproxy** — маршрутизация трафика устройств через sing-box
@@ -96,22 +99,62 @@ WIFI_SSID=MyWiFi WIFI_PASSWORD=secret sh setup.sh
 | `WIFI_PASSWORD` | Пароль Wi-Fi | — |
 | `WIFI_SSID_5G` | Имя Wi-Fi 5GHz | `{SSID}_5G` |
 
+## Обновление существующей установки
+
+Если у вас уже работающая установка и вы хотите обновить скрипты/шаблоны или включить adblock:
+
+```sh
+# 1. С ПК/ноутбука закинуть репу на роутер:
+cd vpn-zapret-openwrt-setup
+tar czf /tmp/vpn-setup.tar.gz --exclude='.git' --exclude='.docs' .
+scp -O -P <SSH_ПОРТ> /tmp/vpn-setup.tar.gz root@<IP_РОУТЕРА>:/tmp/
+
+# 2. SSH на роутер и распаковать:
+ssh -p <SSH_ПОРТ> root@<IP_РОУТЕРА>
+mkdir -p /tmp/vpn-setup && cd /tmp/vpn-setup
+tar xzf /tmp/vpn-setup.tar.gz
+
+# 3. Запустить обновление:
+sh upgrade.sh
+```
+
+Интерактивное меню позволяет выбрать что обновлять:
+
+| Опция | Что делает |
+|---|---|
+| **Обновить шаблоны и скрипты** | Деплой новых шаблонов, CGI панели, init.d скриптов, shared library |
+| **Включить sing-box adblock** | Скачать adblock rule-set + внедрить во все конфиги |
+| **Установить AdGuard Home** | Установить AGH (opkg/binary), мигрировать DNS (dnsmasq :5353 → AGH :53) |
+| **Полное обновление** | Всё вышеперечисленное |
+| **Откатить DNS** | Вернуть dnsmasq на :53, остановить AdGuard Home |
+
+Или флаги для неинтерактивного режима: `sh upgrade.sh --all`, `--adblock-only`, `--agh-only`, `--templates-only`, `--rollback`.
+
+Все настройки сохраняются: VPN-профили, per-device правила, custom routes, kill switch, имена устройств. Бэкап создаётся в `/tmp/vpn-upgrade-backup-*` перед любыми изменениями.
+
+> **Совет:** Если SSH на нестандартном порту, используйте `-P <порт>` с scp и `-p <порт>` с ssh. На Windows используйте WSL2 для SSH/SCP — у Windows SSH бывают проблемы с правами на `.ssh/config`.
+
 ## Структура репозитория
 
 ```
-├── setup.sh                              # Основной скрипт
+├── setup.sh                              # Основной скрипт (определяет существующую установку → предлагает upgrade)
+├── upgrade.sh                            # Инкрементальное обновление (шаблоны, adblock, AGH)
 ├── configs/
 │   ├── sing-box/
 │   │   ├── templates/                    # Шаблоны конфигов sing-box (синтаксис %%PLACEHOLDER%%)
 │   │   │   ├── config_full_vpn.tpl.json
 │   │   │   └── config_global_except_ru.tpl.json
-│   │   └── rules/                        # Локальные наборы правил (geoip-ru.srs, geosite-category-ru.srs)
+│   │   └── rules/                        # Наборы правил (geoip-ru.srs, geosite-category-ru.srs)
+│   ├── adguardhome/                      # Конфиг AdGuard Home по умолчанию
 │   ├── zapret/                           # Конфиг и хостлист zapret
 │   └── nftables/                         # Скрипт создания nft таблиц
 ├── scripts/
-│   ├── init.d/sing-box                   # init.d скрипт
+│   ├── lib/generate.sh                   # Shared library (генерация конфигов, adblock плейсхолдеры)
+│   ├── init.d/
+│   │   ├── sing-box                      # init.d скрипт sing-box
+│   │   └── proxy-routing                 # Boot-скрипт nftables/tproxy
 │   ├── cgi-bin/vpn                       # CGI веб-панель
-│   └── update-rulesets.sh                # Обновление наборов правил (geoip/geosite)
+│   └── update-rulesets.sh                # Обновление правил (geoip/geosite + ads)
 ```
 
 ## Веб-панель
@@ -128,8 +171,11 @@ WIFI_SSID=MyWiFi WIFI_PASSWORD=secret sh setup.sh
   - Переименование профилей
   - Назначение профилей отдельным устройствам
   - Установка профиля по умолчанию для новых устройств
+- **Переключатель adblock** — включение/выключение блокировки рекламы sing-box (появляется после установки rule-set)
 - Добавление/удаление устройств по MAC
 - Именование устройств
+- Kill switch — блокировка трафика при падении VPN
+- Кастомная маршрутизация доменов (bypass или force-VPN)
 - Кнопка **DEFAULT** — устройство под catch-all VPN (нажать для отключения)
 - Новые устройства, добавленные через панель, получают VPN ON (Global -RU) по умолчанию
 

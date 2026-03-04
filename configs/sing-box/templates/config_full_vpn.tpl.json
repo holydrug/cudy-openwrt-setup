@@ -14,13 +14,13 @@
         "tag": "dns-direct",
         "address": "local",
         "detour": "direct"
-      }
+      }%%ADBLOCK_DNS_SERVER%%
     ],
     "rules": [
       {
         "outbound": "direct",
         "server": "dns-direct"
-      }
+      }%%ADBLOCK_DNS_RULE%%
 %%CUSTOM_DNS_RULES%%
     ]
   },
@@ -45,7 +45,7 @@
     {
       "type": "direct",
       "tag": "direct"
-    }
+    }%%ADBLOCK_BLOCK_OUTBOUND%%
   ],
   "experimental": {
     "cache_file": {
@@ -58,9 +58,9 @@
       {
         "ip_cidr": ["%%VLESS_SERVER%%/32"],
         "outbound": "direct"
-      }
+      }%%ADBLOCK_ROUTE_RULE%%
 %%CUSTOM_ROUTE_RULES%%
-    ],
+    ]%%ADBLOCK_RULE_SET_SECTION%%
     "auto_detect_interface": true
   }
 }

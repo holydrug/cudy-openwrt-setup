@@ -13,6 +13,9 @@ Automated VPN + DPI bypass setup for OpenWrt routers with sing-box, zapret, and 
   - `full_vpn` — all traffic through VPN
   - `global_except_ru` — all traffic through VPN except Russian IPs/domains
   - Each profile gets a dedicated pair of sing-box instances on unique ports
+- **Adblock** — two-layer ad blocking:
+  - **sing-box rule-set** — blocks ads in VPN traffic (geosite-category-ads-all)
+  - **AdGuard Home** — DNS-level ad blocking for all devices, with web UI on port 3000
 - **zapret (nfqws2)** — DPI bypass for YouTube, Discord, etc. without VPN
 - **Web panel** (`http://<ROUTER_IP>/cgi-bin/vpn`) — per-device VPN and zapret control by MAC address
 - **nftables tproxy** — per-device traffic routing through sing-box
@@ -97,22 +100,62 @@ WIFI_SSID=MyWiFi WIFI_PASSWORD=secret sh setup.sh
 | `WIFI_PASSWORD` | Wi-Fi password | — |
 | `WIFI_SSID_5G` | Wi-Fi 5GHz SSID | `{SSID}_5G` |
 
+## Upgrading an Existing Installation
+
+If you already have a working setup and want to update scripts, templates, or enable adblock:
+
+```sh
+# 1. From your PC/laptop, upload the repo to the router:
+cd vpn-zapret-openwrt-setup
+tar czf /tmp/vpn-setup.tar.gz --exclude='.git' --exclude='.docs' .
+scp -O -P <SSH_PORT> /tmp/vpn-setup.tar.gz root@<ROUTER_IP>:/tmp/
+
+# 2. SSH into the router and extract:
+ssh -p <SSH_PORT> root@<ROUTER_IP>
+mkdir -p /tmp/vpn-setup && cd /tmp/vpn-setup
+tar xzf /tmp/vpn-setup.tar.gz
+
+# 3. Run the upgrade:
+sh upgrade.sh
+```
+
+The interactive menu lets you choose what to upgrade:
+
+| Option | What it does |
+|---|---|
+| **Update templates & scripts** | Deploy latest templates, CGI panel, init.d scripts, shared library |
+| **Enable sing-box adblock** | Download ad-blocking rule-set + inject into all configs |
+| **Install AdGuard Home** | Install AGH (opkg/binary), migrate DNS (dnsmasq :5353 → AGH :53) |
+| **Full upgrade** | All of the above |
+| **Rollback DNS** | Restore dnsmasq to :53, stop AdGuard Home |
+
+Or use flags for non-interactive mode: `sh upgrade.sh --all`, `--adblock-only`, `--agh-only`, `--templates-only`, `--rollback`.
+
+All existing settings are preserved: VPN profiles, per-device rules, custom routes, kill switch, device names. A backup is created at `/tmp/vpn-upgrade-backup-*` before any changes.
+
+> **Note:** If SSH uses a non-standard port, use `-P <port>` with scp and `-p <port>` with ssh. On Windows, use WSL2 for SSH/SCP to avoid permission issues with `.ssh/config`.
+
 ## Repository Structure
 
 ```
-├── setup.sh                              # Main setup script
+├── setup.sh                              # Main setup script (detects existing install → offers upgrade)
+├── upgrade.sh                            # Incremental upgrade script (templates, adblock, AGH)
 ├── configs/
 │   ├── sing-box/
 │   │   ├── templates/                    # sing-box config templates (%%PLACEHOLDER%% syntax)
 │   │   │   ├── config_full_vpn.tpl.json
 │   │   │   └── config_global_except_ru.tpl.json
 │   │   └── rules/                        # Local rule sets (geoip-ru.srs, geosite-category-ru.srs)
+│   ├── adguardhome/                      # AdGuard Home default config
 │   ├── zapret/                           # zapret config and hostlist
 │   └── nftables/                         # nft table creation script
 ├── scripts/
-│   ├── init.d/sing-box                   # sing-box init.d script
+│   ├── lib/generate.sh                   # Shared library (config generation, adblock placeholders)
+│   ├── init.d/
+│   │   ├── sing-box                      # sing-box init.d script
+│   │   └── proxy-routing                 # nftables/tproxy boot script
 │   ├── cgi-bin/vpn                       # CGI web panel
-│   └── update-rulesets.sh                # Rule set updater (geoip/geosite)
+│   └── update-rulesets.sh                # Rule set updater (geoip/geosite + ads)
 ```
 
 ## Web Panel
@@ -129,8 +172,11 @@ Features:
   - Rename profiles
   - Assign profiles to individual devices
   - Set default profile for new devices
+- **Adblock toggle** — enable/disable sing-box ad blocking (appears when rule-set is installed)
 - Add/remove devices by MAC address
 - Custom device naming
+- Kill switch — drop all traffic when VPN is down
+- Custom domain routing (bypass or force-VPN per domain)
 - **DEFAULT** button — indicates device is covered by catch-all VPN (click to disable)
 - New devices added via the panel default to VPN ON (Global -RU)
 
