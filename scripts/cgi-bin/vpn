@@ -218,7 +218,7 @@ remove_bypass() {
 add_bypass() {
     local m="$1"
     nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep "ether saddr $m" | grep -v "tproxy" | grep -q "accept" && return 0
-    nft insert rule ip proxy_tproxy prerouting \
+    nft add rule ip proxy_tproxy prerouting \
         iifname "$LAN_IFACE" ether saddr "$m" accept 2>/dev/null
 }
 
@@ -227,14 +227,14 @@ apply_vpn_on() {
     local port="$2"
     remove_bypass "$m"
     nft list chain ip proxy_tproxy prerouting 2>/dev/null | grep "ether saddr $m" | grep -q "tproxy" && return 0
-    nft insert rule ip proxy_tproxy prerouting \
-        iifname "$LAN_IFACE" ether saddr "$m" \
-        ip daddr != "{ $VPN_EXCLUDE }" \
-        meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
-    nft insert rule ip proxy_tproxy prerouting \
+    nft add rule ip proxy_tproxy prerouting \
         iifname "$LAN_IFACE" ether saddr "$m" \
         ip daddr != "{ $VPN_EXCLUDE }" \
         meta l4proto tcp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
+    nft add rule ip proxy_tproxy prerouting \
+        iifname "$LAN_IFACE" ether saddr "$m" \
+        ip daddr != "{ $VPN_EXCLUDE }" \
+        meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
 }
 
 apply_vpn_off() {
