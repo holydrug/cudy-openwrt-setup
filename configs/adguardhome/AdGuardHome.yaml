@@ -6,17 +6,17 @@ language: ""
 theme: auto
 dns:
   bind_hosts:
-    - 0.0.0.0
-  port: 53
+    - 127.0.0.1
+  port: 5354
   anonymize_client_ip: false
   ratelimit: 0
   ratelimit_whitelist: []
   refuse_any: true
   upstream_dns:
-    - 127.0.0.1:5353
+    - 1.1.1.1
   upstream_dns_file: ""
   bootstrap_dns:
-    - 127.0.0.1:5353
+    - 1.1.1.1
   fallback_dns: []
   all_servers: false
   fastest_addr: false
@@ -34,7 +34,7 @@ dns:
   cache_ttl_max: 0
   cache_optimistic: true
   bogus_nxdomain: []
-  aaaa_disabled: false
+  aaaa_disabled: true
   enable_dnssec: false
   edns_client_subnet:
     custom_ip: ""

@@ -252,22 +252,39 @@ install_agh() {
     ln -sf /opt/AdGuardHome/AdGuardHome /usr/bin/AdGuardHome
     rm -rf "$tmp_dir"
 
-    # Create init.d script for AGH
+    # Create init.d script for AGH (matches opkg convention: lowercase config, START=19)
     cat > /etc/init.d/adguardhome <<'AGHEOF'
 #!/bin/sh /etc/rc.common
 
-START=95
-STOP=15
+PROG=/usr/bin/AdGuardHome
 
 USE_PROCD=1
 
+START=19
+STOP=89
+
+boot() {
+    adguardhome_boot=1
+    start "$@"
+}
+
 start_service() {
+    if [ -n "$adguardhome_boot" ]; then
+        return 0
+    fi
+
     procd_open_instance
-    procd_set_param command /opt/AdGuardHome/AdGuardHome -c /etc/AdGuardHome.yaml -w /opt/AdGuardHome --no-check-update
+    procd_set_param command "$PROG" -c /etc/adguardhome.yaml -w /opt/AdGuardHome --pidfile /run/adguardhome.pid --no-check-update
     procd_set_param respawn
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_close_instance
+}
+
+service_triggers() {
+    if [ -n "$adguardhome_boot" ]; then
+        procd_add_raw_trigger "interface.*.up" 5000 /etc/init.d/adguardhome restart
+    fi
 }
 AGHEOF
     chmod +x /etc/init.d/adguardhome
@@ -277,7 +294,7 @@ AGHEOF
 }
 
 deploy_agh_config() {
-    # opkg package uses /etc/adguardhome.yaml (lowercase)
+    # Canonical path: /etc/adguardhome.yaml (lowercase, matches opkg convention)
     local agh_conf="/etc/adguardhome.yaml"
     if [ ! -f "$agh_conf" ]; then
         log "Deploying AdGuard Home config..."
@@ -285,11 +302,21 @@ deploy_agh_config() {
     else
         log "AdGuard Home config exists, keeping current"
     fi
+
+    # Disable IPv6 RA/DHCPv6 on LAN to prevent WiFi "No Internet" issues
+    # (router has no WAN IPv6, advertising IPv6 DNS breaks connectivity checks)
+    uci set dhcp.lan.dhcpv6='disabled' 2>/dev/null || true
+    uci set dhcp.lan.ra='disabled' 2>/dev/null || true
+    uci set dhcp.@dnsmasq[0].filter_aaaa='1' 2>/dev/null || true
+    uci commit dhcp 2>/dev/null || true
 }
 
 # ===== DNS migration =====
+# Architecture: dnsmasq(:53) → AGH(:5354) → external DNS
+# dnsmasq stays on :53 (required for WiFi compatibility on some hardware)
+# AGH runs as backend ad-filtering resolver on localhost:5354
 migrate_dns() {
-    log "Starting DNS migration (dnsmasq -> AGH)..."
+    log "Starting DNS migration (adding AGH backend)..."
 
     # Step 1: verify DNS works before touching anything
     if ! check_dns "pre-migration"; then
@@ -297,33 +324,30 @@ migrate_dns() {
         return 1
     fi
 
-    # Step 2: enable AGH (don't start yet — dnsmasq still holds :53)
+    # Step 2: enable and start AGH on :5354 (backend, no conflict with dnsmasq)
     /etc/init.d/adguardhome enable
-
-    # Step 3: atomic swap — stop dnsmasq, start AGH, restart dnsmasq on :5353
-    # This minimizes the window where nothing listens on :53
-    log "Swapping DNS: dnsmasq :53 -> AGH :53 + dnsmasq :5353..."
-    /etc/init.d/dnsmasq stop
     /etc/init.d/adguardhome start
 
-    # Poll for AGH to bind :53 (up to 5s)
+    # Poll for AGH to bind :5354 (up to 5s)
     local tries=0
     while [ "$tries" -lt 5 ]; do
-        if netstat -tlnp 2>/dev/null | grep 'AdGuard' | grep -q ':53 ' || \
-           netstat -ulnp 2>/dev/null | grep 'AdGuard' | grep -q ':53 '; then
+        if netstat -tlnp 2>/dev/null | grep 'AdGuard' | grep -q ':5354 ' || \
+           netstat -ulnp 2>/dev/null | grep 'AdGuard' | grep -q ':5354 '; then
             break
         fi
         sleep 1
         tries=$((tries + 1))
     done
 
-    # Now move dnsmasq to :5353 and restart (AGH upstreams to it)
-    uci set dhcp.@dnsmasq[0].port=5353
+    # Step 3: point dnsmasq to AGH as upstream (dnsmasq stays on :53)
+    uci set dhcp.@dnsmasq[0].noresolv=1
+    uci delete dhcp.@dnsmasq[0].server 2>/dev/null || true
+    uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#5354'
     uci commit dhcp
-    /etc/init.d/dnsmasq start
+    /etc/init.d/dnsmasq restart
 
     # Step 4: verify DNS end-to-end
-    sleep 1
+    sleep 2
     if check_dns "post-migration"; then
         log "DNS migration successful!"
         echo "1" > /etc/vpn_agh_installed
@@ -352,22 +376,23 @@ check_dns() {
 
 # ===== Rollback DNS =====
 rollback_dns() {
-    log "Rolling back DNS to dnsmasq on :53..."
+    log "Rolling back DNS (removing AGH backend)..."
 
     # Stop AdGuard Home
     /etc/init.d/adguardhome stop 2>/dev/null || true
     /etc/init.d/adguardhome disable 2>/dev/null || true
     killall AdGuardHome 2>/dev/null || true
 
-    # Restore dnsmasq to port 53
-    uci set dhcp.@dnsmasq[0].port=53
+    # Restore dnsmasq to use system resolv.conf (ISP DNS)
+    uci delete dhcp.@dnsmasq[0].noresolv 2>/dev/null || true
+    uci delete dhcp.@dnsmasq[0].server 2>/dev/null || true
     uci commit dhcp
     /etc/init.d/dnsmasq restart
 
     # Wait briefly and verify
     sleep 1
     if check_dns "rollback"; then
-        log "DNS restored to dnsmasq on :53"
+        log "DNS restored to dnsmasq (direct)"
     else
         warn "DNS may still be down after rollback — check manually"
     fi
