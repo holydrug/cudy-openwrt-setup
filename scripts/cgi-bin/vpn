@@ -82,7 +82,7 @@ for param; do
         mac) mac="$(echo "$val" | sed 's/%3A/:/g; s/%3a/:/g')" ;;
         name) name="$(echo "$val" | sed 's/+/ /g; s/%20/ /g; s/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g' | xargs -0 printf '%b' 2>/dev/null || echo "$val" | sed 's/+/ /g; s/%20/ /g')" ;;
         preset) preset="$val" ;;
-        vless_uri) vless_uri="$(echo "$val" | sed 's/%3A/:/g; s/%3a/:/g; s/%40/@/g; s/%3F/?/g; s/%3f/?/g; s/%23/#/g; s/%26/\&/g; s/%3D/=/g; s/%3d/=/g; s/%2F/\//g; s/%2f/\//g; s/+/ /g')" ;;
+        vless_uri) vless_uri="$(echo "$val" | sed 's/%25/%/g; s/%3A/:/g; s/%3a/:/g; s/%40/@/g; s/%3F/?/g; s/%3f/?/g; s/%23/#/g; s/%26/\&/g; s/%3D/=/g; s/%3d/=/g; s/%2F/\//g; s/%2f/\//g; s/+/ /g')" ;;
         profile_id) profile_id="$val" ;;
         rule_domain) rule_domain="$(echo "$val" | sed 's/+/ /g; s/%2F/\//g; s/%2f/\//g' | tr -d ' ')" ;;
         rule_action) rule_action="$val" ;;
@@ -99,6 +99,9 @@ valid_mac() {
 parse_vless_uri() {
     local raw="$1"
     local uri name_part query authority uuid hostport
+
+    # Trim leading/trailing whitespace
+    raw=$(echo "$raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
     # Strip vless:// prefix
     uri="${raw#vless://}"
@@ -124,6 +127,7 @@ parse_vless_uri() {
 
     # Parse query params
     P_PBK="" ; P_SID="" ; P_SNI="" ; P_FP="chrome" ; P_FLOW="" ; P_SECURITY="reality"
+    P_TRANSPORT="tcp" ; P_TRANSPORT_MODE="" ; P_TRANSPORT_PATH=""
     local old_ifs="$IFS"
     IFS='&'
     for kv in $query; do
@@ -135,12 +139,24 @@ parse_vless_uri() {
             fp) P_FP="$v" ;;
             flow) P_FLOW="$v" ;;
             security) P_SECURITY="$v" ;;
+            type) P_TRANSPORT="$v" ;;
+            mode) P_TRANSPORT_MODE="$v" ;;
+            path) P_TRANSPORT_PATH=$(echo "$v" | sed 's/%2F/\//g; s/%2f/\//g') ;;
         esac
     done
     IFS="$old_ifs"
 
     [ -z "$P_FP" ] && P_FP="chrome"
     [ -z "$P_NAME" ] && P_NAME="$P_SERVER"
+    [ -z "$P_TRANSPORT" ] && P_TRANSPORT="tcp"
+    [ -z "$P_TRANSPORT_MODE" ] && P_TRANSPORT_MODE="auto"
+    [ -z "$P_TRANSPORT_PATH" ] && P_TRANSPORT_PATH="/"
+
+    # Auto-detect engine from transport
+    P_ENGINE="sing-box"
+    case "$P_TRANSPORT" in
+        xhttp) P_ENGINE="xray" ;;
+    esac
 
     # Defaults depend on security type
     case "$P_SECURITY" in
@@ -150,7 +166,12 @@ parse_vless_uri() {
             ;;
         *)
             P_SECURITY="reality"
-            [ -z "$P_FLOW" ] && P_FLOW="xtls-rprx-vision"
+            # Flow only for TCP transport
+            if [ "$P_TRANSPORT" = "tcp" ] && [ -z "$P_FLOW" ]; then
+                P_FLOW="xtls-rprx-vision"
+            elif [ "$P_TRANSPORT" != "tcp" ]; then
+                P_FLOW=""
+            fi
             ;;
     esac
 
@@ -382,7 +403,7 @@ do_add_profile() {
     local new_next_id=$((next_id + 1))
 
     # Build new profile JSON entry
-    local entry="{\"id\":\"$pid\",\"name\":\"$P_NAME\",\"server\":\"$P_SERVER\",\"server_port\":$P_PORT,\"uuid\":\"$P_UUID\",\"security\":\"$P_SECURITY\",\"public_key\":\"$P_PBK\",\"short_id\":\"$P_SID\",\"sni\":\"$P_SNI\",\"fingerprint\":\"$P_FP\",\"flow\":\"$P_FLOW\",\"port_full_vpn\":$port_full,\"port_global_except_ru\":$port_global}"
+    local entry="{\"id\":\"$pid\",\"name\":\"$P_NAME\",\"server\":\"$P_SERVER\",\"server_port\":$P_PORT,\"uuid\":\"$P_UUID\",\"security\":\"$P_SECURITY\",\"public_key\":\"$P_PBK\",\"short_id\":\"$P_SID\",\"sni\":\"$P_SNI\",\"fingerprint\":\"$P_FP\",\"flow\":\"$P_FLOW\",\"engine\":\"$P_ENGINE\",\"transport\":\"$P_TRANSPORT\",\"transport_mode\":\"$P_TRANSPORT_MODE\",\"transport_path\":\"$P_TRANSPORT_PATH\",\"port_full_vpn\":$port_full,\"port_global_except_ru\":$port_global}"
 
     # Insert into profiles array
     local old_profiles=$(grep -o '"profiles":\[[^]]*\]' "$PROFILES_FILE" | sed 's/"profiles":\[//;s/\]$//')
@@ -399,12 +420,20 @@ do_add_profile() {
 
     echo "{\"profiles\":[$new_profiles],\"default_profile_id\":\"$def_pid\",\"next_port\":$new_next_port,\"next_id\":$new_next_id}" > "$PROFILES_FILE"
 
-    # Generate sing-box configs
-    generate_configs "$pid" "$port_full" "$port_global" \
-        "$P_SERVER" "$P_PORT" "$P_UUID" "$P_PBK" "$P_SID" "$P_SNI" "$P_FP" "$P_FLOW" "$P_SECURITY"
-
-    # Start new sing-box instances
-    /etc/init.d/sing-box restart 2>/dev/null
+    # Generate configs for the appropriate engine
+    case "$P_ENGINE" in
+        xray)
+            generate_xray_configs "$pid" "$port_full" "$port_global" \
+                "$P_SERVER" "$P_PORT" "$P_UUID" "$P_PBK" "$P_SID" "$P_SNI" \
+                "$P_FP" "$P_FLOW" "$P_SECURITY" "$P_TRANSPORT" "$P_TRANSPORT_MODE" "$P_TRANSPORT_PATH"
+            /etc/init.d/xray-core restart 2>/dev/null
+            ;;
+        *)
+            generate_configs "$pid" "$port_full" "$port_global" \
+                "$P_SERVER" "$P_PORT" "$P_UUID" "$P_PBK" "$P_SID" "$P_SNI" "$P_FP" "$P_FLOW" "$P_SECURITY"
+            /etc/init.d/sing-box restart 2>/dev/null
+            ;;
+    esac
 
     # Rebuild catch-all with updated server exclusion list
     rebuild_catchall
@@ -423,11 +452,13 @@ do_delete_profile() {
         exit 0
     }
 
-    # Remove configs
+    # Remove configs (both engines)
     rm -f "/etc/sing-box/config_full_vpn_${pid}.json"
     rm -f "/etc/sing-box/config_global_except_ru_${pid}.json"
     rm -f "/etc/sing-box/cache-full-${pid}.db"
     rm -f "/etc/sing-box/cache-global-${pid}.db"
+    rm -f "/etc/xray/config_full_vpn_${pid}.json"
+    rm -f "/etc/xray/config_global_except_ru_${pid}.json"
 
     # Remove profile from JSON — rebuild without this profile
     local new_profiles=""
@@ -473,8 +504,9 @@ do_delete_profile() {
         fi
     done
 
-    # Restart sing-box and rebuild catch-all
+    # Restart services and rebuild catch-all
     /etc/init.d/sing-box restart 2>/dev/null
+    /etc/init.d/xray-core restart 2>/dev/null || true
     rebuild_catchall
 }
 
@@ -823,7 +855,7 @@ get_profile_ids | while read pid; do
     p_security=$(get_profile_field "$pid" "security")
     [ -z "$p_security" ] && p_security="reality"
 
-    # Check server status via sing-box process
+    # Check server status via process
     status_class="status-check"
     status_text="..."
     if pgrep -f "config_full_vpn_${pid}.json" >/dev/null 2>&1; then
@@ -837,11 +869,20 @@ get_profile_ids | while read pid; do
     default_badge=""
     [ "$pid" = "$default_pid" ] && default_badge='<span class="badge-default">DEFAULT</span>'
 
+    p_engine=$(get_profile_field "$pid" "engine")
+    [ -z "$p_engine" ] && p_engine="sing-box"
+    p_transport=$(get_profile_field "$pid" "transport")
+    [ -z "$p_transport" ] && p_transport="tcp"
+    case "$p_engine" in
+        xray) engine_badge='<span style="background:#ff6b00;color:#fff;border-radius:4px;padding:2px 6px;font-size:.7em;font-weight:600;margin-left:4px">XRAY</span>' ;;
+        *) engine_badge='<span style="background:#0066ff;color:#fff;border-radius:4px;padding:2px 6px;font-size:.7em;font-weight:600;margin-left:4px">SB</span>' ;;
+    esac
+
     cat <<EOF
 <div class="profile-card">
   <div class="profile-info">
-    <div class="profile-name" id="pname-${pid}"><span>${p_name}</span><span class="edit-btn" onclick="editProfileName('${pid}','${p_name}')">edit</span>${default_badge} <span class="${status_class}">${status_text}</span></div>
-    <div class="profile-server">${p_server}:${p_server_port} [${p_security}]</div>
+    <div class="profile-name" id="pname-${pid}"><span>${p_name}</span><span class="edit-btn" onclick="editProfileName('${pid}','${p_name}')">edit</span>${default_badge} <span class="${status_class}">${status_text}</span>${engine_badge}</div>
+    <div class="profile-server">${p_server}:${p_server_port} [${p_security}/${p_transport}]</div>
     <div class="profile-ports">Ports: full=${p_port_full} global-ru=${p_port_global}</div>
   </div>
   <div class="profile-actions">

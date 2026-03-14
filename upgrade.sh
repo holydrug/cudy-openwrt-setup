@@ -101,6 +101,7 @@ backup_state() {
     mkdir -p "$bak"
     cp -f /etc/sing-box/templates/*.tpl.json "$bak/" 2>/dev/null || true
     cp -f /etc/sing-box/config_*.json "$bak/" 2>/dev/null || true
+    cp -f /etc/xray/config_*.json "$bak/" 2>/dev/null || true
     [ -f /etc/config/dhcp ] && cp -f /etc/config/dhcp "$bak/dhcp.uci" 2>/dev/null || true
     BACKUP_DIR="$bak"
     log "Backup saved to $BACKUP_DIR"
@@ -145,6 +146,12 @@ upgrade_scripts() {
     deploy "$SCRIPT_DIR/configs/nftables/proxy-tproxy.sh" /etc/proxy-tproxy.sh
     chmod +x /etc/proxy-tproxy.sh
 
+    # Xray-core init.d
+    mkdir -p /etc/xray
+    deploy "$SCRIPT_DIR/configs/xray-core/xray-core.init" /etc/init.d/xray-core
+    chmod +x /etc/init.d/xray-core
+    /etc/init.d/xray-core enable 2>/dev/null || true
+
     log "Scripts upgraded"
 }
 
@@ -182,7 +189,7 @@ install_adblock_ruleset() {
 
 # ===== Regenerate configs =====
 regenerate_configs() {
-    log "Regenerating sing-box configs from templates..."
+    log "Regenerating VPN configs..."
     PROFILES_FILE="/etc/vless_profiles.json"
     TEMPLATES_DIR="/etc/sing-box/templates"
     CUSTOM_RULES_FILE="/etc/sing-box/custom_rules.json"
@@ -190,7 +197,7 @@ regenerate_configs() {
 
     . "$SCRIPT_DIR/scripts/lib/generate.sh"
     regenerate_all_configs
-    log "Configs regenerated and sing-box restarted"
+    log "Configs regenerated and services restarted"
 }
 
 # ===== Install AdGuard Home =====

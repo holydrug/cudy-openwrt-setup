@@ -1,0 +1,40 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=99
+
+PROFILES_FILE="/etc/vless_profiles.json"
+
+start_service() {
+    [ -f "$PROFILES_FILE" ] || return 0
+
+    grep -o '"id":"[^"]*"' "$PROFILES_FILE" | sed 's/"id":"//;s/"//' > /tmp/xray-profiles.tmp
+
+    while read profile_id; do
+        # Only start xray profiles
+        engine=$(grep -o "\"id\":\"${profile_id}\"[^}]*" "$PROFILES_FILE" | grep -o '"engine":"[^"]*"' | head -1 | sed 's/"engine":"//;s/"//')
+        [ "$engine" = "xray" ] || continue
+
+        config="/etc/xray/config_full_vpn_${profile_id}.json"
+        [ -f "$config" ] && {
+            procd_open_instance "full-vpn-${profile_id}"
+            procd_set_param command /usr/bin/xray run -c "$config"
+            procd_set_param respawn 3600 5 5
+            procd_set_param stderr 1
+            procd_set_param stdout 1
+            procd_close_instance
+        }
+
+        config="/etc/xray/config_global_except_ru_${profile_id}.json"
+        [ -f "$config" ] && {
+            procd_open_instance "global-except-ru-${profile_id}"
+            procd_set_param command /usr/bin/xray run -c "$config"
+            procd_set_param respawn 3600 5 5
+            procd_set_param stderr 1
+            procd_set_param stdout 1
+            procd_close_instance
+        }
+    done < /tmp/xray-profiles.tmp
+
+    rm -f /tmp/xray-profiles.tmp
+}

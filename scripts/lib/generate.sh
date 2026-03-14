@@ -289,6 +289,110 @@ SECEOF
     rm -f "$sec_file"
 }
 
+# ===== Xray-core config generation =====
+
+generate_xray_configs() {
+    local pid="$1" port_full="$2" port_global="$3"
+    local server="$4" server_port="$5" uuid="$6"
+    local pbk="$7" sid="$8" sni="$9"
+    shift 9
+    local fp="$1" flow="$2" security="$3"
+    local transport="${4:-tcp}" transport_mode="${5:-auto}" transport_path="${6:-/}"
+
+    mkdir -p /etc/xray
+
+    # Build flow field
+    local flow_json=""
+    [ -n "$flow" ] && flow_json=",\"flow\":\"$flow\""
+
+    # Build transport settings
+    local transport_block=""
+    case "$transport" in
+        xhttp)
+            transport_block="\"network\":\"xhttp\",\"xhttpSettings\":{\"mode\":\"${transport_mode}\",\"path\":\"${transport_path}\"}"
+            ;;
+        ws)
+            transport_block="\"network\":\"ws\",\"wsSettings\":{\"path\":\"${transport_path}\"}"
+            ;;
+        *)
+            transport_block="\"network\":\"tcp\""
+            ;;
+    esac
+
+    # Build security settings
+    local security_block=""
+    case "$security" in
+        reality)
+            security_block=",\"security\":\"reality\",\"realitySettings\":{\"serverName\":\"$sni\",\"fingerprint\":\"$fp\",\"publicKey\":\"$pbk\",\"shortId\":\"$sid\"}"
+            ;;
+        *)
+            security_block=",\"security\":\"none\""
+            ;;
+    esac
+
+    # Adblock rules
+    local adblock_rules="" adblock_outbound=""
+    local adblock_on="0"
+    [ -f /etc/vpn_adblock ] && adblock_on=$(cat /etc/vpn_adblock 2>/dev/null)
+    if [ "$adblock_on" = "1" ]; then
+        adblock_rules=",{\"type\":\"field\",\"domain\":[\"geosite:category-ads-all\"],\"outboundTag\":\"block\"}"
+        adblock_outbound=",{\"tag\":\"block\",\"protocol\":\"blackhole\",\"settings\":{}}"
+    fi
+
+    # Custom domain rules
+    local custom_rules=""
+    if [ -f "$CUSTOM_RULES_FILE" ]; then
+        local direct_raw=$(grep -o '"direct":\[[^]]*\]' "$CUSTOM_RULES_FILE" | sed 's/"direct":\[//;s/\]$//' | tr -d ' ')
+        local vpn_raw=$(grep -o '"vpn":\[[^]]*\]' "$CUSTOM_RULES_FILE" | sed 's/"vpn":\[//;s/\]$//' | tr -d ' ')
+        if [ -n "$direct_raw" ]; then
+            local xd=$(echo "$direct_raw" | sed 's/"//g' | awk -F',' '{for(i=1;i<=NF;i++) if($i!="") printf "\"domain:%s\",", $i}' | sed 's/,$//')
+            [ -n "$xd" ] && custom_rules="${custom_rules},{\"type\":\"field\",\"domain\":[${xd}],\"outboundTag\":\"direct\"}"
+        fi
+        if [ -n "$vpn_raw" ]; then
+            local xv=$(echo "$vpn_raw" | sed 's/"//g' | awk -F',' '{for(i=1;i<=NF;i++) if($i!="") printf "\"domain:%s\",", $i}' | sed 's/,$//')
+            [ -n "$xv" ] && custom_rules="${custom_rules},{\"type\":\"field\",\"domain\":[${xv}],\"outboundTag\":\"vless-out\"}"
+        fi
+    fi
+
+    for mode in full_vpn global_except_ru; do
+        local listen_port
+        case "$mode" in
+            full_vpn) listen_port="$port_full" ;;
+            *) listen_port="$port_global" ;;
+        esac
+
+        local geo_rules=""
+        if [ "$mode" = "global_except_ru" ]; then
+            geo_rules=",{\"type\":\"field\",\"domain\":[\"geosite:category-ru\"],\"outboundTag\":\"direct\"},{\"type\":\"field\",\"ip\":[\"geoip:ru\"],\"outboundTag\":\"direct\"}"
+        fi
+
+        cat > "/etc/xray/config_${mode}_${pid}.json" << XRAYEOF
+{
+  "log":{"loglevel":"warning"},
+  "inbounds":[{
+    "tag":"tproxy-in",
+    "protocol":"dokodemo-door",
+    "port":${listen_port},
+    "listen":"::",
+    "settings":{"network":"tcp,udp","followRedirect":true},
+    "sniffing":{"enabled":true,"destOverride":["http","tls","quic"]},
+    "streamSettings":{"sockopt":{"tproxy":"tproxy"}}
+  }],
+  "outbounds":[
+    {"tag":"vless-out","protocol":"vless","settings":{"vnext":[{"address":"${server}","port":${server_port},"users":[{"id":"${uuid}","encryption":"none"${flow_json}}]}]},"streamSettings":{${transport_block}${security_block}}},
+    {"tag":"direct","protocol":"freedom","settings":{}}${adblock_outbound}
+  ],
+  "routing":{
+    "domainStrategy":"AsIs",
+    "rules":[
+      {"type":"field","ip":["${server}"],"outboundTag":"direct"}${adblock_rules}${custom_rules}${geo_rules}
+    ]
+  }
+}
+XRAYEOF
+    done
+}
+
 # ===== Regenerate all configs =====
 
 regenerate_all_configs() {
@@ -304,8 +408,24 @@ regenerate_all_configs() {
         local security=$(get_profile_field "$pid" "security")
         local port_full=$(get_profile_port "$pid" "full_vpn")
         local port_global=$(get_profile_port "$pid" "global_except_ru")
-        generate_configs "$pid" "$port_full" "$port_global" \
-            "$server" "$server_port" "$uuid" "$pbk" "$sid" "$sni" "$fp" "$flow" "$security"
+        local engine=$(get_profile_field "$pid" "engine")
+        [ -z "$engine" ] && engine="sing-box"
+
+        case "$engine" in
+            xray)
+                local transport=$(get_profile_field "$pid" "transport")
+                local transport_mode=$(get_profile_field "$pid" "transport_mode")
+                local transport_path=$(get_profile_field "$pid" "transport_path")
+                generate_xray_configs "$pid" "$port_full" "$port_global" \
+                    "$server" "$server_port" "$uuid" "$pbk" "$sid" "$sni" \
+                    "$fp" "$flow" "$security" "$transport" "$transport_mode" "$transport_path"
+                ;;
+            *)
+                generate_configs "$pid" "$port_full" "$port_global" \
+                    "$server" "$server_port" "$uuid" "$pbk" "$sid" "$sni" "$fp" "$flow" "$security"
+                ;;
+        esac
     done || true
     /etc/init.d/sing-box restart 2>/dev/null || true
+    /etc/init.d/xray-core restart 2>/dev/null || true
 }

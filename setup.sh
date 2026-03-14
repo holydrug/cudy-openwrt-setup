@@ -100,6 +100,9 @@ parse_vless_uri() {
     local raw="$1"
     local uri query authority hostport
 
+    # Trim leading/trailing whitespace
+    raw=$(echo "$raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
     uri="${raw#vless://}"
 
     case "$uri" in
@@ -119,6 +122,7 @@ parse_vless_uri() {
     VLESS_PORT="${hostport##*:}"
 
     REALITY_PUBLIC_KEY="" ; REALITY_SHORT_ID="" ; REALITY_SNI="" ; TLS_FINGERPRINT="chrome" ; VLESS_FLOW="" ; VLESS_SECURITY="reality"
+    VLESS_TRANSPORT="tcp" ; VLESS_TRANSPORT_MODE="" ; VLESS_TRANSPORT_PATH=""
     local old_ifs="$IFS"
     IFS='&'
     for kv in $query; do
@@ -130,12 +134,24 @@ parse_vless_uri() {
             fp) TLS_FINGERPRINT="$v" ;;
             flow) VLESS_FLOW="$v" ;;
             security) VLESS_SECURITY="$v" ;;
+            type) VLESS_TRANSPORT="$v" ;;
+            mode) VLESS_TRANSPORT_MODE="$v" ;;
+            path) VLESS_TRANSPORT_PATH=$(echo "$v" | sed 's/%2F/\//g; s/%2f/\//g') ;;
         esac
     done
     IFS="$old_ifs"
 
     [ -z "$TLS_FINGERPRINT" ] && TLS_FINGERPRINT="chrome"
     [ -z "$VLESS_PROFILE_NAME" ] && VLESS_PROFILE_NAME="$VLESS_SERVER"
+    [ -z "$VLESS_TRANSPORT" ] && VLESS_TRANSPORT="tcp"
+    [ -z "$VLESS_TRANSPORT_MODE" ] && VLESS_TRANSPORT_MODE="auto"
+    [ -z "$VLESS_TRANSPORT_PATH" ] && VLESS_TRANSPORT_PATH="/"
+
+    # Auto-detect engine from transport
+    VLESS_ENGINE="sing-box"
+    case "$VLESS_TRANSPORT" in
+        xhttp) VLESS_ENGINE="xray" ;;
+    esac
 
     case "$VLESS_SECURITY" in
         none)
@@ -144,7 +160,12 @@ parse_vless_uri() {
             ;;
         *)
             VLESS_SECURITY="reality"
-            [ -z "$VLESS_FLOW" ] && VLESS_FLOW="xtls-rprx-vision"
+            # Flow only for TCP transport
+            if [ "$VLESS_TRANSPORT" = "tcp" ] && [ -z "$VLESS_FLOW" ]; then
+                VLESS_FLOW="xtls-rprx-vision"
+            elif [ "$VLESS_TRANSPORT" != "tcp" ]; then
+                VLESS_FLOW=""
+            fi
             [ -z "$REALITY_SNI" ] && REALITY_SNI="www.icloud.com"
             ;;
     esac
@@ -184,6 +205,10 @@ else
         [ -z "$TLS_FINGERPRINT" ] && TLS_FINGERPRINT="chrome"
         [ -z "$VLESS_FLOW" ] && VLESS_FLOW="xtls-rprx-vision"
         [ -z "$VLESS_PROFILE_NAME" ] && VLESS_PROFILE_NAME="$VLESS_SERVER"
+        [ -z "$VLESS_TRANSPORT" ] && VLESS_TRANSPORT="tcp"
+        [ -z "$VLESS_TRANSPORT_MODE" ] && VLESS_TRANSPORT_MODE="auto"
+        [ -z "$VLESS_TRANSPORT_PATH" ] && VLESS_TRANSPORT_PATH="/"
+        [ -z "$VLESS_ENGINE" ] && VLESS_ENGINE="sing-box"
     fi
 fi
 
@@ -222,7 +247,7 @@ log "Installing packages..."
 opkg update
 
 # Base packages (always needed)
-opkg install sing-box kmod-nft-tproxy kmod-nf-tproxy kmod-inet-diag ip-full curl
+opkg install sing-box xray-core kmod-nft-tproxy kmod-nf-tproxy kmod-inet-diag ip-full curl
 
 # Git only needed for full-git mode
 if [ "$SETUP_MODE" = "full-git" ]; then
@@ -279,6 +304,20 @@ deploy "$SCRIPT_DIR/configs/sing-box/templates/config_global_except_ru.tpl.json"
 cp "$SCRIPT_DIR/configs/sing-box/rules/geoip-ru.srs" /etc/sing-box/rules/
 cp "$SCRIPT_DIR/configs/sing-box/rules/geosite-category-ru.srs" /etc/sing-box/rules/
 
+# ===== 3b. Deploy xray-core =====
+log "Deploying xray-core..."
+mkdir -p /etc/xray
+deploy "$SCRIPT_DIR/configs/xray-core/xray-core.init" /etc/init.d/xray-core
+chmod +x /etc/init.d/xray-core
+
+# Download xray geo-data (for domain/IP-based routing rules)
+if [ ! -f /usr/share/xray/geoip.dat ] || [ ! -f /usr/share/xray/geosite.dat ]; then
+    log "Downloading xray geo-data..."
+    mkdir -p /usr/share/xray
+    curl -sL "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" -o /usr/share/xray/geoip.dat
+    curl -sL "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" -o /usr/share/xray/geosite.dat
+fi
+
 # ===== 4. Create initial vless_profiles.json =====
 PROFILES_FILE="/etc/vless_profiles.json"
 PROFILE_ID="p1"
@@ -289,15 +328,15 @@ if [ -f "$PROFILES_FILE" ] && grep -q '"profiles":\[' "$PROFILES_FILE"; then
     log "Profiles file exists, keeping existing profiles"
 else
     log "Creating VLESS profiles..."
-    echo "{\"profiles\":[{\"id\":\"$PROFILE_ID\",\"name\":\"$VLESS_PROFILE_NAME\",\"server\":\"$VLESS_SERVER\",\"server_port\":$VLESS_PORT,\"uuid\":\"$VLESS_UUID\",\"security\":\"$VLESS_SECURITY\",\"public_key\":\"$REALITY_PUBLIC_KEY\",\"short_id\":\"$REALITY_SHORT_ID\",\"sni\":\"$REALITY_SNI\",\"fingerprint\":\"$TLS_FINGERPRINT\",\"flow\":\"$VLESS_FLOW\",\"port_full_vpn\":$PORT_FULL,\"port_global_except_ru\":$PORT_GLOBAL}],\"default_profile_id\":\"$PROFILE_ID\",\"next_port\":12347,\"next_id\":2}" > "$PROFILES_FILE"
+    echo "{\"profiles\":[{\"id\":\"$PROFILE_ID\",\"name\":\"$VLESS_PROFILE_NAME\",\"server\":\"$VLESS_SERVER\",\"server_port\":$VLESS_PORT,\"uuid\":\"$VLESS_UUID\",\"security\":\"$VLESS_SECURITY\",\"public_key\":\"$REALITY_PUBLIC_KEY\",\"short_id\":\"$REALITY_SHORT_ID\",\"sni\":\"$REALITY_SNI\",\"fingerprint\":\"$TLS_FINGERPRINT\",\"flow\":\"$VLESS_FLOW\",\"engine\":\"$VLESS_ENGINE\",\"transport\":\"$VLESS_TRANSPORT\",\"transport_mode\":\"$VLESS_TRANSPORT_MODE\",\"transport_path\":\"$VLESS_TRANSPORT_PATH\",\"port_full_vpn\":$PORT_FULL,\"port_global_except_ru\":$PORT_GLOBAL}],\"default_profile_id\":\"$PROFILE_ID\",\"next_port\":12347,\"next_id\":2}" > "$PROFILES_FILE"
 fi
 
 # ===== 5. Initialize custom rules (idempotent) =====
 CUSTOM_RULES_FILE="/etc/sing-box/custom_rules.json"
 [ -f "$CUSTOM_RULES_FILE" ] || echo '{"direct":[],"vpn":[]}' > "$CUSTOM_RULES_FILE"
 
-# ===== 6. Source shared library & generate sing-box configs =====
-log "Generating sing-box configs..."
+# ===== 6. Source shared library & generate configs =====
+log "Generating VPN configs (engine: $VLESS_ENGINE)..."
 
 TEMPLATES_DIR="/etc/sing-box/templates"
 . "$SCRIPT_DIR/scripts/lib/generate.sh"
@@ -305,10 +344,21 @@ TEMPLATES_DIR="/etc/sing-box/templates"
 # Initialize adblock OFF for fresh install
 [ -f /etc/vpn_adblock ] || echo "0" > /etc/vpn_adblock
 
-generate_configs "$PROFILE_ID" "$PORT_FULL" "$PORT_GLOBAL" \
-    "$VLESS_SERVER" "$VLESS_PORT" "$VLESS_UUID" \
-    "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" "$REALITY_SNI" \
-    "$TLS_FINGERPRINT" "$VLESS_FLOW" "$VLESS_SECURITY"
+case "$VLESS_ENGINE" in
+    xray)
+        generate_xray_configs "$PROFILE_ID" "$PORT_FULL" "$PORT_GLOBAL" \
+            "$VLESS_SERVER" "$VLESS_PORT" "$VLESS_UUID" \
+            "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" "$REALITY_SNI" \
+            "$TLS_FINGERPRINT" "$VLESS_FLOW" "$VLESS_SECURITY" \
+            "$VLESS_TRANSPORT" "$VLESS_TRANSPORT_MODE" "$VLESS_TRANSPORT_PATH"
+        ;;
+    *)
+        generate_configs "$PROFILE_ID" "$PORT_FULL" "$PORT_GLOBAL" \
+            "$VLESS_SERVER" "$VLESS_PORT" "$VLESS_UUID" \
+            "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" "$REALITY_SNI" \
+            "$TLS_FINGERPRINT" "$VLESS_FLOW" "$VLESS_SECURITY"
+        ;;
+esac
 
 # ===== 7. Deploy sing-box init.d =====
 log "Deploying sing-box init.d script..."
@@ -420,6 +470,9 @@ log "Enabling and starting services..."
 
 /etc/init.d/sing-box enable
 /etc/init.d/sing-box start || warn "sing-box failed to start, check configs"
+
+/etc/init.d/xray-core enable
+/etc/init.d/xray-core start || warn "xray-core failed to start, check configs"
 
 # Zapret uses sysv init — enable via rc.d symlink, start directly
 if [ "$SETUP_MODE" != "vpn-only" ]; then
