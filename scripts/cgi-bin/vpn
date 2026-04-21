@@ -556,8 +556,13 @@ case "$action" in
         ;;
     add_rule)
         if [ -n "$rule_domain" ] && echo "$rule_action" | grep -qE '^(direct|vpn)$'; then
-            # Validate domain: letters, digits, dots, hyphens only
-            if echo "$rule_domain" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$'; then
+            # Normalize: strip leading *. (domain_suffix covers subdomains)
+            rule_domain=$(echo "$rule_domain" | sed 's/^\*\.//')
+            # Bare IP without CIDR mask → add /32
+            echo "$rule_domain" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && rule_domain="${rule_domain}/32"
+            # Validate: domain OR IP/CIDR
+            if echo "$rule_domain" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$' || \
+               echo "$rule_domain" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$'; then
                 add_custom_rule "$rule_domain" "$rule_action"
                 regenerate_all_configs
             fi
@@ -954,27 +959,31 @@ vpn_domains=$(grep -o '"vpn":\[[^]]*\]' "$CUSTOM_RULES_FILE" 2>/dev/null | sed '
 has_rules=""
 echo "$direct_domains" | tr ',' '\n' | tr -d '"' | while read d; do
     [ -z "$d" ] && continue
-    enc_d=$(echo "$d" | sed 's/ /%20/g')
-    echo "<div class=\"profile-card\"><div class=\"profile-info\"><span class=\"profile-name\">${d}</span> <span style=\"color:#00c853;font-size:.8em\">DIRECT</span></div><div class=\"profile-actions\"><a class=\"btn btn-sm btn-danger\" href=\"?action=delete_rule&rule_domain=${enc_d}&rule_action=direct\">Delete</a></div></div>"
+    enc_d=$(echo "$d" | sed 's/ /%20/g; s|/|%2F|g')
+    type_badge="DOMAIN"
+    echo "$d" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/' && type_badge="IP"
+    echo "<div class=\"profile-card\"><div class=\"profile-info\"><span class=\"profile-name\">${d}</span> <span style=\"color:#888;font-size:.7em\">${type_badge}</span> <span style=\"color:#00c853;font-size:.8em\">DIRECT</span></div><div class=\"profile-actions\"><a class=\"btn btn-sm btn-danger\" href=\"?action=delete_rule&rule_domain=${enc_d}&rule_action=direct\">Delete</a></div></div>"
 done
 
 echo "$vpn_domains" | tr ',' '\n' | tr -d '"' | while read d; do
     [ -z "$d" ] && continue
-    enc_d=$(echo "$d" | sed 's/ /%20/g')
-    echo "<div class=\"profile-card\"><div class=\"profile-info\"><span class=\"profile-name\">${d}</span> <span style=\"color:#00d2ff;font-size:.8em\">VPN</span></div><div class=\"profile-actions\"><a class=\"btn btn-sm btn-danger\" href=\"?action=delete_rule&rule_domain=${enc_d}&rule_action=vpn\">Delete</a></div></div>"
+    enc_d=$(echo "$d" | sed 's/ /%20/g; s|/|%2F|g')
+    type_badge="DOMAIN"
+    echo "$d" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/' && type_badge="IP"
+    echo "<div class=\"profile-card\"><div class=\"profile-info\"><span class=\"profile-name\">${d}</span> <span style=\"color:#888;font-size:.7em\">${type_badge}</span> <span style=\"color:#00d2ff;font-size:.8em\">VPN</span></div><div class=\"profile-actions\"><a class=\"btn btn-sm btn-danger\" href=\"?action=delete_rule&rule_domain=${enc_d}&rule_action=vpn\">Delete</a></div></div>"
 done
 
 cat <<'CUSTOMFORM'
 <form class="add-form" method="POST" action="/cgi-bin/vpn" style="margin-top:10px">
 <input type="hidden" name="action" value="add_rule">
-<input class="add-input" type="text" name="rule_domain" placeholder="example.com" required style="flex:1;min-width:180px">
+<input class="add-input" type="text" name="rule_domain" placeholder="example.com or 155.133.0.0/16" required style="flex:1;min-width:180px">
 <select class="preset-select" name="rule_action">
 <option value="direct">Direct (bypass VPN)</option>
 <option value="vpn">VPN (force through VPN)</option>
 </select>
 <button class="add-btn" type="submit">Add Rule</button>
 </form>
-<div style="color:#666;font-size:.75em;margin-top:6px">* covers the domain and all its subdomains</div>
+<div style="color:#666;font-size:.75em;margin-top:6px">Domains: covers the domain and all subdomains (*.example.com supported). IP/CIDR: e.g. 155.133.0.0/16</div>
 </div>
 CUSTOMFORM
 

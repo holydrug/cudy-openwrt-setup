@@ -35,6 +35,14 @@ get_profile_ids() {
 
 # ===== Custom rules builder =====
 
+_filter_domains() {
+    echo "$1" | tr ',' '\n' | grep -vE '^"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]' | tr '\n' ',' | sed 's/,$//'
+}
+
+_filter_ips() {
+    echo "$1" | tr ',' '\n' | grep -E '^"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]' | tr '\n' ',' | sed 's/,$//'
+}
+
 build_custom_rules_file() {
     local mode="$1" route_out="$2" dns_out="$3"
     local rules_file="$CUSTOM_RULES_FILE"
@@ -44,21 +52,35 @@ build_custom_rules_file() {
     local direct=$(grep -o '"direct":\[[^]]*\]' "$rules_file" | sed 's/"direct":\[//;s/\]$//' | tr -d ' ')
     local vpn=$(grep -o '"vpn":\[[^]]*\]' "$rules_file" | sed 's/"vpn":\[//;s/\]$//' | tr -d ' ')
 
+    local direct_domains=$(_filter_domains "$direct")
+    local direct_ips=$(_filter_ips "$direct")
+    local vpn_domains=$(_filter_domains "$vpn")
+    local vpn_ips=$(_filter_ips "$vpn")
+
     case "$mode" in
         global_except_ru)
-            [ -n "$direct" ] && {
-                echo "      {\"domain_suffix\":[$direct],\"outbound\":\"direct\"}," >> "$route_out"
-                echo "      {\"domain_suffix\":[$direct],\"server\":\"dns-direct\"}," >> "$dns_out"
+            [ -n "$direct_domains" ] && {
+                echo "      {\"domain_suffix\":[$direct_domains],\"outbound\":\"direct\"}," >> "$route_out"
+                echo "      {\"domain_suffix\":[$direct_domains],\"server\":\"dns-direct\"}," >> "$dns_out"
             } || true
-            [ -n "$vpn" ] && {
-                echo "      {\"domain_suffix\":[$vpn],\"outbound\":\"vless-out\"}," >> "$route_out"
-                echo "      {\"domain_suffix\":[$vpn],\"server\":\"dns-remote\"}," >> "$dns_out"
+            [ -n "$direct_ips" ] && {
+                echo "      {\"ip_cidr\":[$direct_ips],\"outbound\":\"direct\"}," >> "$route_out"
+            } || true
+            [ -n "$vpn_domains" ] && {
+                echo "      {\"domain_suffix\":[$vpn_domains],\"outbound\":\"vless-out\"}," >> "$route_out"
+                echo "      {\"domain_suffix\":[$vpn_domains],\"server\":\"dns-remote\"}," >> "$dns_out"
+            } || true
+            [ -n "$vpn_ips" ] && {
+                echo "      {\"ip_cidr\":[$vpn_ips],\"outbound\":\"vless-out\"}," >> "$route_out"
             } || true
             ;;
         full_vpn)
-            [ -n "$direct" ] && {
-                echo "      ,{\"domain_suffix\":[$direct],\"outbound\":\"direct\"}" >> "$route_out"
-                echo "      ,{\"domain_suffix\":[$direct],\"server\":\"dns-direct\"}" >> "$dns_out"
+            [ -n "$direct_domains" ] && {
+                echo "      ,{\"domain_suffix\":[$direct_domains],\"outbound\":\"direct\"}" >> "$route_out"
+                echo "      ,{\"domain_suffix\":[$direct_domains],\"server\":\"dns-direct\"}" >> "$dns_out"
+            } || true
+            [ -n "$direct_ips" ] && {
+                echo "      ,{\"ip_cidr\":[$direct_ips],\"outbound\":\"direct\"}" >> "$route_out"
             } || true
             ;;
     esac
@@ -339,18 +361,22 @@ generate_xray_configs() {
         adblock_outbound=",{\"tag\":\"block\",\"protocol\":\"blackhole\",\"settings\":{}}"
     fi
 
-    # Custom domain rules
+    # Custom domain + IP rules
     local custom_rules=""
     if [ -f "$CUSTOM_RULES_FILE" ]; then
         local direct_raw=$(grep -o '"direct":\[[^]]*\]' "$CUSTOM_RULES_FILE" | sed 's/"direct":\[//;s/\]$//' | tr -d ' ')
         local vpn_raw=$(grep -o '"vpn":\[[^]]*\]' "$CUSTOM_RULES_FILE" | sed 's/"vpn":\[//;s/\]$//' | tr -d ' ')
         if [ -n "$direct_raw" ]; then
-            local xd=$(echo "$direct_raw" | sed 's/"//g' | awk -F',' '{for(i=1;i<=NF;i++) if($i!="") printf "\"domain:%s\",", $i}' | sed 's/,$//')
+            local xd=$(echo "$direct_raw" | sed 's/"//g' | tr ',' '\n' | grep -vE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]' | awk 'NF {printf "\"domain:%s\",", $0}' | sed 's/,$//')
+            local xdi=$(echo "$direct_raw" | sed 's/"//g' | tr ',' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]' | awk 'NF {printf "\"%s\",", $0}' | sed 's/,$//')
             [ -n "$xd" ] && custom_rules="${custom_rules},{\"type\":\"field\",\"domain\":[${xd}],\"outboundTag\":\"direct\"}"
+            [ -n "$xdi" ] && custom_rules="${custom_rules},{\"type\":\"field\",\"ip\":[${xdi}],\"outboundTag\":\"direct\"}"
         fi
         if [ -n "$vpn_raw" ]; then
-            local xv=$(echo "$vpn_raw" | sed 's/"//g' | awk -F',' '{for(i=1;i<=NF;i++) if($i!="") printf "\"domain:%s\",", $i}' | sed 's/,$//')
+            local xv=$(echo "$vpn_raw" | sed 's/"//g' | tr ',' '\n' | grep -vE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]' | awk 'NF {printf "\"domain:%s\",", $0}' | sed 's/,$//')
+            local xvi=$(echo "$vpn_raw" | sed 's/"//g' | tr ',' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]' | awk 'NF {printf "\"%s\",", $0}' | sed 's/,$//')
             [ -n "$xv" ] && custom_rules="${custom_rules},{\"type\":\"field\",\"domain\":[${xv}],\"outboundTag\":\"vless-out\"}"
+            [ -n "$xvi" ] && custom_rules="${custom_rules},{\"type\":\"field\",\"ip\":[${xvi}],\"outboundTag\":\"vless-out\"}"
         fi
     fi
 
