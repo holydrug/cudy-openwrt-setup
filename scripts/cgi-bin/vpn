@@ -256,6 +256,8 @@ apply_vpn_on() {
         iifname "$LAN_IFACE" ether saddr "$m" \
         ip daddr != "{ $VPN_EXCLUDE }" \
         meta l4proto udp tproxy to :$port meta mark set 0x1 accept 2>/dev/null
+    # Per-device rules are appended to the end; rebuild catch-all so it stays below them.
+    rebuild_catchall
 }
 
 apply_vpn_off() {
@@ -266,6 +268,8 @@ apply_vpn_off() {
             nft delete rule ip proxy_tproxy prerouting handle "$handle" 2>/dev/null
         done
     add_bypass "$m"
+    # Bypass is appended to the end; rebuild catch-all so it stays below the bypass.
+    rebuild_catchall
 }
 
 apply_zapret_off() {
