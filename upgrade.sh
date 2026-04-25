@@ -1,7 +1,7 @@
 #!/bin/sh
 # Upgrade script for vpn-zapret-openwrt-setup
 # Safe incremental updates: templates, scripts, adblock, AdGuard Home
-# Usage: sh upgrade.sh [--all|--adblock-only|--agh-only|--templates-only|--rollback]
+# Usage: sh upgrade.sh [--all|--adblock-only|--agh-only|--templates-only|--rollback|--fix-dns]
 
 set -e
 
@@ -48,9 +48,10 @@ case "${1:-}" in
     --agh-only)       MODE="agh" ;;
     --templates-only) MODE="templates" ;;
     --rollback)       MODE="rollback" ;;
+    --fix-dns)        MODE="fix-dns" ;;
     "") ;;
     *)
-        echo "Usage: $0 [--all|--adblock-only|--agh-only|--templates-only|--rollback]"
+        echo "Usage: $0 [--all|--adblock-only|--agh-only|--templates-only|--rollback|--fix-dns]"
         exit 1
         ;;
 esac
@@ -318,6 +319,96 @@ deploy_agh_config() {
     uci commit dhcp 2>/dev/null || true
 }
 
+# ===== AGH HTTP API helpers =====
+agh_api_url() {
+    local conf="/etc/adguardhome.yaml"
+    local host port
+    host=$(awk '/^bind_host:/ {print $2; exit}' "$conf" 2>/dev/null)
+    port=$(awk '/^bind_port:/ {print $2; exit}' "$conf" 2>/dev/null)
+    { [ -z "$host" ] || [ "$host" = "0.0.0.0" ]; } && host="127.0.0.1"
+    [ -z "$port" ] && port="3000"
+    echo "http://${host}:${port}"
+}
+
+agh_curl() {
+    if [ -n "${AGH_USER:-}" ] && [ -n "${AGH_PASS:-}" ]; then
+        curl -u "${AGH_USER}:${AGH_PASS}" "$@"
+    else
+        curl "$@"
+    fi
+}
+
+agh_api_wait() {
+    local url="$1" tries=0 code
+    while [ "$tries" -lt 10 ]; do
+        code=$(agh_curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$url/control/status" 2>/dev/null || echo "000")
+        [ "$code" = "200" ] && return 0
+        sleep 1
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+# ===== Configure AGH DNS upstreams (idempotent) =====
+# Patches AGH DNS upstreams via HTTP API only when current state matches the
+# bad default (upstream_dns=["1.1.1.1"] AND fallback_dns=[]). Custom user
+# setups are preserved. AGH itself rewrites /etc/adguardhome.yaml after apply.
+configure_agh_upstreams() {
+    [ -f /etc/adguardhome.yaml ] || { warn "AGH config not found, skipping DNS upstream patch"; return 0; }
+
+    local api code dns_info upstream_now fallback_now
+    api=$(agh_api_url)
+
+    if ! agh_api_wait "$api"; then
+        warn "AGH HTTP API ($api) not responding, skipping DNS upstream patch"
+        return 0
+    fi
+
+    code=$(agh_curl -s -o /tmp/agh_dns_info.json -w '%{http_code}' --max-time 5 "$api/control/dns_info" 2>/dev/null || echo "000")
+    case "$code" in
+        200) ;;
+        401)
+            warn "AGH HTTP API requires auth. Set AGH_USER/AGH_PASS env vars or update DNS upstreams via web UI."
+            return 0
+            ;;
+        *)
+            warn "AGH /control/dns_info returned HTTP $code, skipping"
+            return 0
+            ;;
+    esac
+
+    dns_info=$(cat /tmp/agh_dns_info.json 2>/dev/null)
+    upstream_now=$(echo "$dns_info" | sed -n 's/.*"upstream_dns":\(\[[^]]*\]\).*/\1/p')
+    fallback_now=$(echo "$dns_info" | sed -n 's/.*"fallback_dns":\(\[[^]]*\]\).*/\1/p')
+
+    if [ "$upstream_now" != '["1.1.1.1"]' ] || [ "$fallback_now" != '[]' ]; then
+        log "AGH DNS upstreams already customized (upstream=$upstream_now fallback=$fallback_now), skipping"
+        return 0
+    fi
+
+    log "Patching AGH DNS upstreams via HTTP API..."
+    cp /etc/adguardhome.yaml "/etc/adguardhome.yaml.bak.$(date +%s)" 2>/dev/null || true
+
+    # Pre-flight: test upstream reachability (informational, doesn't block)
+    local test_payload='{"upstream_dns":["1.1.1.1","8.8.8.8","77.88.8.8"],"fallback_dns":["8.8.8.8","77.88.8.8"],"bootstrap_dns":["1.1.1.1","8.8.8.8","9.9.9.9"]}'
+    agh_curl -s --max-time 10 -X POST -H 'Content-Type: application/json' \
+        -d "$test_payload" "$api/control/test_upstream_dns" >/tmp/agh_dns_test.json 2>/dev/null || true
+    log "Upstream test: $(cat /tmp/agh_dns_test.json 2>/dev/null | head -c 300)"
+
+    # Apply: AGH validates input and atomically rewrites yaml + applies live
+    local apply_payload='{"upstream_dns":["1.1.1.1","8.8.8.8","77.88.8.8"],"bootstrap_dns":["1.1.1.1","8.8.8.8","9.9.9.9"],"fallback_dns":["8.8.8.8","77.88.8.8"],"upstream_mode":"parallel"}'
+    code=$(agh_curl -s -o /tmp/agh_dns_apply.json -w '%{http_code}' --max-time 10 \
+        -X POST -H 'Content-Type: application/json' \
+        -d "$apply_payload" "$api/control/dns_config" 2>/dev/null || echo "000")
+
+    if [ "$code" = "200" ]; then
+        log "AGH DNS upstreams updated (upstream_mode=parallel, fallback added)"
+    else
+        warn "AGH /control/dns_config returned HTTP $code: $(cat /tmp/agh_dns_apply.json 2>/dev/null)"
+        return 1
+    fi
+}
+
 # ===== DNS migration =====
 # Architecture: dnsmasq(:53) → AGH(:5354) → external DNS
 # dnsmasq stays on :53 (required for WiFi compatibility on some hardware)
@@ -415,6 +506,7 @@ case "$MODE" in
         upgrade_scripts
         [ -f /etc/vpn_adblock ] || echo "0" > /etc/vpn_adblock
         regenerate_configs
+        [ "$HAS_AGH" = "1" ] && configure_agh_upstreams
         log "Templates & scripts upgrade complete"
         ;;
     adblock)
@@ -430,6 +522,7 @@ case "$MODE" in
         upgrade_scripts
         install_agh
         migrate_dns
+        configure_agh_upstreams
         log "AdGuard Home installation complete"
         log "Web UI: http://$(uci get network.lan.ipaddr 2>/dev/null || echo '192.168.1.1'):3000"
         ;;
@@ -441,6 +534,7 @@ case "$MODE" in
         regenerate_configs
         install_agh
         migrate_dns
+        configure_agh_upstreams
         log "Full upgrade complete!"
         log "AGH Web UI: http://$(uci get network.lan.ipaddr 2>/dev/null || echo '192.168.1.1'):3000"
         log "VPN Panel: http://$(uci get network.lan.ipaddr 2>/dev/null || echo '192.168.1.1')/cgi-bin/vpn"
@@ -448,6 +542,9 @@ case "$MODE" in
     rollback)
         rollback_dns
         log "Rollback complete"
+        ;;
+    fix-dns)
+        configure_agh_upstreams
         ;;
 esac
 
